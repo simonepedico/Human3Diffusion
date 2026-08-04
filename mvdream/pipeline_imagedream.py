@@ -21,7 +21,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from mvdream.mv_unet import MultiViewUNetModel, get_camera
 
 import PIL
-import torch.nn.functional as F
 import kornia
 import einops
 
@@ -30,7 +29,8 @@ logger = logging.get_logger(__name__)
 
 class ImageDreamPipeline(DiffusionPipeline):
 
-    _optional_components = ["feature_extractor", "image_encoder"]
+    # PEDICO: aggiunto channel_adapter 
+    _optional_components = ["feature_extractor", "image_encoder", "channel_adapter"]
 
     def __init__(
         self,
@@ -39,9 +39,9 @@ class ImageDreamPipeline(DiffusionPipeline):
         tokenizer: CLIPTokenizer,
         text_encoder: CLIPTextModel,
         scheduler: DDIMScheduler,
-        # imagedream variant
         image_encoder: CLIPVisionModel,
-        feature_extractor: CLIPImageProcessor =None,
+        channel_adapter: Optional[torch.nn.Module] = None, # Accetta l'adapter addestrato
+        feature_extractor: CLIPImageProcessor = None,
         requires_safety_checker: bool = False,
     ):
         super().__init__()
@@ -77,6 +77,7 @@ class ImageDreamPipeline(DiffusionPipeline):
             new_config["clip_sample"] = False
             scheduler._internal_dict = FrozenDict(new_config)
 
+        
         self.register_modules(
             vae=vae,
             unet=unet,
@@ -85,50 +86,29 @@ class ImageDreamPipeline(DiffusionPipeline):
             text_encoder=text_encoder,
             feature_extractor=feature_extractor,
             image_encoder=image_encoder,
+            channel_adapter=channel_adapter,
         )
+        
+        
+        if self.channel_adapter is None:
+            self.channel_adapter = torch.nn.Conv2d(7, 3, kernel_size=3, padding=1)
+
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.register_to_config(requires_safety_checker=requires_safety_checker)
 
     def enable_vae_slicing(self):
-        r"""
-        Enable sliced VAE decoding.
-
-        When this option is enabled, the VAE will split the input tensor in slices to compute decoding in several
-        steps. This is useful to save some memory and allow larger batch sizes.
-        """
         self.vae.enable_slicing()
 
     def disable_vae_slicing(self):
-        r"""
-        Disable sliced VAE decoding. If `enable_vae_slicing` was previously invoked, this method will go back to
-        computing decoding in one step.
-        """
         self.vae.disable_slicing()
 
     def enable_vae_tiling(self):
-        r"""
-        Enable tiled VAE decoding.
-
-        When this option is enabled, the VAE will split the input tensor into tiles to compute decoding and encoding in
-        several steps. This is useful to save a large amount of memory and to allow the processing of larger images.
-        """
         self.vae.enable_tiling()
 
     def disable_vae_tiling(self):
-        r"""
-        Disable tiled VAE decoding. If `enable_vae_tiling` was previously invoked, this method will go back to
-        computing decoding in one step.
-        """
         self.vae.disable_tiling()
 
     def enable_sequential_cpu_offload(self, gpu_id=0):
-        r"""
-        Offloads all models to CPU using accelerate, significantly reducing memory usage. When called, unet,
-        text_encoder, vae and safety checker have their state dicts saved to CPU and then are moved to a
-        `torch.device('meta') and loaded to GPU only when their specific submodule has its `forward` method called.
-        Note that offloading happens on a submodule basis. Memory savings are higher than with
-        `enable_model_cpu_offload`, but performance is lower.
-        """
         if is_accelerate_available() and is_accelerate_version(">=", "0.14.0"):
             from accelerate import cpu_offload
         else:
@@ -140,18 +120,13 @@ class ImageDreamPipeline(DiffusionPipeline):
 
         if self.device.type != "cpu":
             self.to("cpu", silence_dtype_warnings=True)
-            torch.cuda.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
+            torch.cuda.empty_cache()
 
-        for cpu_offloaded_model in [self.unet, self.text_encoder, self.vae]:
-            cpu_offload(cpu_offloaded_model, device)
+        for cpu_offloaded_model in [self.unet, self.text_encoder, self.vae, self.channel_adapter]:
+            if cpu_offloaded_model is not None:
+                cpu_offload(cpu_offloaded_model, device)
 
     def enable_model_cpu_offload(self, gpu_id=0):
-        r"""
-        Offloads all models to CPU using accelerate, reducing memory usage with a low impact on performance. Compared
-        to `enable_sequential_cpu_offload`, this method moves one whole model at a time to the GPU when its `forward`
-        method is called, and the model remains in GPU until the next model runs. Memory savings are lower than with
-        `enable_sequential_cpu_offload`, but performance is much better due to the iterative execution of the `unet`.
-        """
         if is_accelerate_available() and is_accelerate_version(">=", "0.17.0.dev0"):
             from accelerate import cpu_offload_with_hook
         else:
@@ -163,23 +138,19 @@ class ImageDreamPipeline(DiffusionPipeline):
 
         if self.device.type != "cpu":
             self.to("cpu", silence_dtype_warnings=True)
-            torch.cuda.empty_cache()  # otherwise we don't see the memory savings (but they probably exist)
+            torch.cuda.empty_cache()
 
         hook = None
-        for cpu_offloaded_model in [self.text_encoder, self.unet, self.vae]:
-            _, hook = cpu_offload_with_hook(
-                cpu_offloaded_model, device, prev_module_hook=hook
-            )
+        for cpu_offloaded_model in [self.text_encoder, self.channel_adapter, self.unet, self.vae]:
+            if cpu_offloaded_model is not None:
+                _, hook = cpu_offload_with_hook(
+                    cpu_offloaded_model, device, prev_module_hook=hook
+                )
 
         self.final_offload_hook = hook
 
     @property
     def _execution_device(self):
-        r"""
-        Returns the device on which the pipeline's models will be executed. After calling
-        `pipeline.enable_sequential_cpu_offload()` the execution device can only be inferred from Accelerate's module
-        hooks.
-        """
         if not hasattr(self.unet, "_hf_hook"):
             return self.device
         for module in self.unet.modules():
@@ -199,30 +170,6 @@ class ImageDreamPipeline(DiffusionPipeline):
         do_classifier_free_guidance: bool,
         negative_prompt=None,
     ):
-        r"""
-        Encodes the prompt into text encoder hidden states.
-
-        Args:
-             prompt (`str` or `List[str]`, *optional*):
-                prompt to be encoded
-            device: (`torch.device`):
-                torch device
-            num_images_per_prompt (`int`):
-                number of images that should be generated per prompt
-            do_classifier_free_guidance (`bool`):
-                whether to use classifier free guidance or not
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds`. instead. If not defined, one has to pass `negative_prompt_embeds`. instead.
-                Ignored when not using guidance (i.e., ignored if `guidance_scale` is less than `1`).
-            prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`torch.FloatTensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
-        """
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
         elif prompt is not None and isinstance(prompt, list):
@@ -268,7 +215,6 @@ class ImageDreamPipeline(DiffusionPipeline):
             attention_mask=attention_mask,
         )
         prompt_embeds = prompt_embeds[0]
-
         prompt_embeds = prompt_embeds.to(dtype=self.text_encoder.dtype, device=device)
 
         bs_embed, seq_len, _ = prompt_embeds.shape
@@ -321,7 +267,6 @@ class ImageDreamPipeline(DiffusionPipeline):
             negative_prompt_embeds = negative_prompt_embeds[0]
 
             seq_len = negative_prompt_embeds.shape[1]
-
             negative_prompt_embeds = negative_prompt_embeds.to(
                 dtype=self.text_encoder.dtype, device=device
             )
@@ -367,7 +312,6 @@ class ImageDreamPipeline(DiffusionPipeline):
             )
         
     def prepare_extra_step_kwargs(self, generator, eta):
-
         accepts_eta = "eta" in set(
             inspect.signature(self.scheduler.step).parameters.keys()
         )
@@ -416,7 +360,6 @@ class ImageDreamPipeline(DiffusionPipeline):
         return latents
 
     def CLIP_preprocess(self, x):
-        
         dtype = x.dtype
         if isinstance(x, torch.Tensor):
             if x.min() < -1.0 or x.max() > 1.0:
@@ -458,7 +401,6 @@ class ImageDreamPipeline(DiffusionPipeline):
             image = image.transpose(0, 3, 1, 2)
             image = torch.from_numpy(image).to(dtype=torch.float32) / 127.5 - 1.0 
         
-
         image = self.CLIP_preprocess(image)
         image = image.to(device=device, dtype=dtype)
         
@@ -468,7 +410,6 @@ class ImageDreamPipeline(DiffusionPipeline):
         return torch.zeros_like(image_embeds), image_embeds
 
     def encode_image_latents(self, image, device, num_images_per_prompt):
-        
         dtype = next(self.image_encoder.parameters()).dtype
 
         if not isinstance(image, (torch.Tensor, PIL.Image.Image, list)):
@@ -508,11 +449,13 @@ class ImageDreamPipeline(DiffusionPipeline):
 
         return torch.zeros_like(latents), latents
 
-    @torch.no_grad()
+    @torch.no_grad() 
     def __call__(
         self,
         prompt: str = "",
         image: Union[np.ndarray, torch.FloatTensor] = None, 
+        depth_map: Union[np.ndarray, torch.FloatTensor] = None,  
+        normal_map: Union[np.ndarray, torch.FloatTensor] = None, 
         height: int = 256,
         width: int = 256,
         elevation: float = None,
@@ -533,6 +476,40 @@ class ImageDreamPipeline(DiffusionPipeline):
         self.unet = self.unet.to(device=device)
         self.vae = self.vae.to(device=device)
         self.text_encoder = self.text_encoder.to(device=device)
+        if self.channel_adapter is not None:
+            self.channel_adapter = self.channel_adapter.to(device=device) 
+
+        def to_tensor(x, expected_channels):
+            if isinstance(x, np.ndarray):
+                if x.ndim == 3 and expected_channels == 1: 
+                    x = x[:, :, 0:1]
+                if x.ndim == 2:
+                    x = x[:, :, None]
+                x = torch.from_numpy(x.transpose(2, 0, 1)).unsqueeze(0).float()
+                if x.max() > 1.0: x = x / 127.5 - 1.0
+            elif isinstance(x, torch.Tensor):
+                if x.ndim == 3: x = x.unsqueeze(0)
+            return x.to(device)
+
+        if image is not None and depth_map is not None and normal_map is not None:
+            img_t = to_tensor(image, 3)
+            depth_t = to_tensor(depth_map, 1)
+            normal_t = to_tensor(normal_map, 3)
+
+            if depth_t.shape[-2:] != img_t.shape[-2:]:
+                depth_t = F.interpolate(depth_t, size=img_t.shape[-2:], mode='bilinear', align_corners=False)
+            if normal_t.shape[-2:] != img_t.shape[-2:]:
+                normal_t = F.interpolate(normal_t, size=img_t.shape[-2:], mode='bilinear', align_corners=False)
+
+            input_7ch = torch.cat([img_t, depth_t, normal_t], dim=1)
+            
+            if self.channel_adapter is not None:
+                # Allineamento dinamico del dtype (fp16 / fp32) basato sui parametri correnti del layer
+                adapter_dtype = next(self.channel_adapter.parameters()).dtype
+                input_7ch = input_7ch.to(dtype=adapter_dtype)
+                
+                image = self.channel_adapter(input_7ch)
+                image = torch.clamp(image, -1.0, 1.0)
 
         self.check_inputs(image, height, width, callback_steps)
 
@@ -577,7 +554,6 @@ class ImageDreamPipeline(DiffusionPipeline):
         )
 
         if image is not None:
-
             if camera_pose is None and elevation is None:
                 assert False, "Camera pose or elevation is required for the model"
             if camera_pose is None:
@@ -594,7 +570,6 @@ class ImageDreamPipeline(DiffusionPipeline):
         camera = einops.rearrange(camera, 'b nv c -> (b nv) c')
         
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
-
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
