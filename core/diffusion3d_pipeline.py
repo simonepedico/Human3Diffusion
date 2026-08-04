@@ -1,3 +1,18 @@
+import torch
+import torch.nn as nn
+
+
+# Ffix diffusers
+if not hasattr(nn.Module, "dtype"):
+    def _get_module_dtype(self):
+        try:
+            return next(self.parameters()).dtype
+        except StopIteration:
+            return torch.float32
+
+    nn.Module.dtype = property(_get_module_dtype)
+
+
 from mvdream.pipeline_imagedream import ImageDreamPipeline
 from diffusers import (
     AutoencoderKL,
@@ -20,6 +35,7 @@ from core.options import Options
 
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 import einops
@@ -30,7 +46,7 @@ import os
 from skimage.io import imsave
 import numpy as np
 
-def get_2ddiffusion_model(unet2d_dict_path, device, org_imgdream_path="ashawkey/imagedream-ipmv-diffusers"):
+def get_2ddiffusion_model(unet2d_dict_path, device, org_imgdream_path="ashawkey/imagedream-ipmv-diffusers", adapter_ckpt_path=None):
 
     noise_scheduler = DDIMScheduler.from_pretrained(org_imgdream_path, subfolder="scheduler", revision=None) 
     image_encoder = CLIPVisionModel.from_pretrained(org_imgdream_path, subfolder="image_encoder", revision=None)
@@ -72,6 +88,32 @@ def get_2ddiffusion_model(unet2d_dict_path, device, org_imgdream_path="ashawkey/
     pipe.text_encoder.eval()
     pipe.text_encoder.requires_grad_(False)
 
+    # PEDICO: adapter layer (7->3 canali) che fonde RGB+depth+normal, introdotto nel
+    # fine-tuning (vedi train_MultiviewDiffusion_diffusion.py). E' l'unico modulo
+    # che nel training aveva pesi diversi da quelli del backbone ImageDream originale,
+    # quindi va ricreato qui e i suoi pesi vanno caricati per coerenza con l'inferenza.
+    adapter_layer = nn.Conv2d(7, 3, kernel_size=3, padding=1)
+
+    if adapter_ckpt_path is None:
+        # stessa convenzione di salvataggio usata in fase di training: il file
+        # "adapter_layer.pt" si trova nella stessa cartella del checkpoint della unet 2D
+        adapter_ckpt_path = os.path.join(os.path.dirname(unet2d_dict_path), "adapter_layer.pt")
+
+    if os.path.isfile(adapter_ckpt_path):
+        adapter_state_dict = torch.load(adapter_ckpt_path, map_location="cpu")
+        adapter_layer.load_state_dict(adapter_state_dict)
+        print(f"############# Adapter layer caricato da {adapter_ckpt_path} #############")
+    else:
+        # se non trovo nessun checkpoint mantengo inizializzazione casuale di default di nn.Conv2d.
+        print(f"[WARN] Nessun checkpoint per l'adapter layer trovato in {adapter_ckpt_path}: inizializzato a pesi casuali.")
+
+    adapter_layer = adapter_layer.to(device=device)
+    adapter_layer.eval()
+    adapter_layer.requires_grad_(False)
+
+
+    pipe.adapter_layer = adapter_layer
+
     return pipe
 
 
@@ -111,6 +153,15 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
     input_image = batch["context_image"].to(device=device, dtype=weight_dtype) 
     gt_pose = batch["imagedream_cam_poses_gt"].to(device=device, dtype=weight_dtype)
 
+    # PEDICO: fusione RGB + depth + normal (7 canali) -> 3 canali, stessa logica
+    # usata in fase di training (train_MultiviewDiffusion_diffusion.py), tramite
+    # l'adapter layer caricato in get_2ddiffusion_model
+    context_depth = batch["context_depth"].squeeze(dim=1).to(device=device, dtype=weight_dtype)
+    context_normal = batch["context_normal"].squeeze(dim=1).to(device=device, dtype=weight_dtype)
+    fused_input = torch.cat([input_image, context_depth, context_normal], dim=1)  # (B, 7, H, W)
+    fused_context_image = diffusion_2d_pipe.adapter_layer(fused_input)
+    fused_context_image = torch.clamp(fused_context_image, -1.0, 1.0).to(dtype=weight_dtype)
+
     cam_view_input = batch['cam_view_imagedream'].to(device=device, dtype=weight_dtype)
     cam_view_proj_input = batch['cam_view_proj_imagedream'].to(device=device, dtype=weight_dtype)
     cam_pos_input = batch['cam_pos_imagedream'].to(device=device, dtype=weight_dtype)
@@ -124,8 +175,8 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
     diffusion_2d_pipe.scheduler.set_timesteps(50, device=device)
     timesteps = diffusion_2d_pipe.scheduler.timesteps
 
-    image_embeds_neg, image_embeds_pos = diffusion_2d_pipe.encode_image(input_image, device, 1) 
-    image_latents_neg, image_latents_pos = diffusion_2d_pipe.encode_image_latents(input_image, device, 1) 
+    image_embeds_neg, image_embeds_pos = diffusion_2d_pipe.encode_image(fused_context_image, device, 1)
+    image_latents_neg, image_latents_pos = diffusion_2d_pipe.encode_image_latents(fused_context_image, device, 1)
 
     _prompt_embeds = diffusion_2d_pipe._encode_prompt(
             prompt=", 3d asset photorealistic human scan",
@@ -199,6 +250,7 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
         vae_decoded_x0 = einops.rearrange(vae_decoded_x0, "(b n) c h w -> b n c h w", n=num_view)
         vae_decoded_xt = einops.rearrange(vae_decoded_xt, "(b n) c h w -> b n c h w", n=num_view)
         vae_decoded_x0xt = torch.cat([vae_decoded_x0, vae_decoded_xt], dim=2)
+
 
         context_image_duplicate = torch.cat([input_image.unsqueeze(dim=1), input_image.unsqueeze(dim=1)], dim=2)
         vae_decoded_x0xt_with_clear_context = torch.cat([vae_decoded_x0xt, context_image_duplicate], dim=1)
@@ -278,6 +330,7 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
     
     vae_decoded_x0xt = torch.cat([vae_decoded_x0, vae_decoded_xt], dim=2)
 
+
     context_image_duplicate = torch.cat([input_image.unsqueeze(dim=1), input_image.unsqueeze(dim=1)], dim=2) 
     vae_decoded_x0xt_with_clear_context = torch.cat([vae_decoded_x0xt, context_image_duplicate], dim=1) 
     vae_decoded_x0xt_with_clear_context = einops.rearrange(vae_decoded_x0xt_with_clear_context, "b n c h w -> (b n) c h w") 
@@ -327,6 +380,3 @@ def save_generation_results(subject_save_folder, batch, device, gaussians, diffu
 
     grid_rendered = make_grid(rendered_output_image, nrow=8) 
     save_image(grid_rendered, os.path.join(subject_save_folder, 'mvrendering_3dgs.png'))
-
-    
-
