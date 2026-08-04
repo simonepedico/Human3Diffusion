@@ -3,11 +3,16 @@ from pathlib import Path
 import os
 from packaging import version
 import torch
+import torch.nn as nn
 import math
 from tqdm import tqdm
 import einops
 import torch.nn.functional as F
 import shutil
+
+from huggingface_hub import list_repo_files, snapshot_download
+from sklearn.model_selection import train_test_split
+from google.colab import userdata
 
 os.environ["WANDB__SERVICE_WAIT"] = "300"
 os.environ["NCCL_P2P_DISABLE"]="1"
@@ -36,7 +41,6 @@ from transformers import (
 )
 from mvdream.mv_unet import MultiViewUNetModel
 from core.dataset_human_imagedream import Imagedream_LGM_dataset
-from imagedream_function import CLIP_preprocess
 from mvdream.pipeline_imagedream import ImageDreamPipeline
 
 logger = get_logger(__name__)
@@ -44,6 +48,18 @@ logger = get_logger(__name__)
 if is_wandb_available():
     os.environ["WANDB_MODE"] = "offline"
     import wandb
+
+# (l'ho messa altrimenti andava in errore)
+def CLIP_preprocess(x):
+    if x.min() < 0:
+        x = (x + 1.0) / 2.0
+    x = F.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
+    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
+    x = (x - mean) / std
+    return x
+# ------------------------------------------------------------------------
+
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Argparser for ImageDream (diffusers) training script.")
@@ -71,6 +87,14 @@ def parse_args(input_args=None):
     parser.add_argument("--set_grads_to_none", default=True)
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
 
+    # altrimenti ottengo "unrecognized argoment"
+    parser.add_argument("--pretrained_model_name_or_path", type=str, default="ashawkey/imagedream-ipmv-diffusers")
+    parser.add_argument("--output_dir", type=str, default="mvd_pretrain")
+    parser.add_argument("--train_batch_size", type=int, default=1)
+    parser.add_argument("--num_train_epochs", type=int, default=100)
+    parser.add_argument("--mixed_precision", type=str, default="bf16")
+
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -78,13 +102,7 @@ def parse_args(input_args=None):
 
     return args
 
-def _encode_text_prompt(
-        tokenizer,
-        text_encoder,
-        prompt,
-        device,
-        batch_size
-    ):
+def _encode_text_prompt(tokenizer, text_encoder, prompt, device, batch_size):
     assert isinstance(prompt, str)
 
     text_inputs = tokenizer(
@@ -135,22 +153,14 @@ def _encode_text_prompt(
     return prompt_embeds
 
 def main(args):
-    args.pretrained_model_name_or_path = "ashawkey/imagedream-ipmv-diffusers"
-
     args.max_train_steps = None
-    args.num_train_epochs = 100
     args.learning_rate = 1e-4
-    args.mixed_precision = 'bf16'
-    
-    args.output_dir = "mvd_pretrain"
     args.tracker_project_name = "train_mvd_pretrain"
-    
     args.num_gpu = 1
-    args.train_batch_size = 1
     args.gradient_accumulation_steps = 1
     args.enable_xformers_memory_efficient_attention = True
-
     args.resolution = 256
+
     args.output_dir = args.output_dir +"_bs_"+str(args.train_batch_size * args.num_gpu * args.gradient_accumulation_steps)
     args.tracker_project_name = args.tracker_project_name + "_bs_" + str(args.train_batch_size * args.num_gpu * args.gradient_accumulation_steps)
 
@@ -201,7 +211,7 @@ def main(args):
     print("Load pretrained human Imagedream Unet Model")
 
     from safetensors.torch import load_file
-    ckpt_mvd_2k2k = load_file('checkpoints/model.safetensors', device='cpu') # load the pretrained MVD UNet
+    ckpt_mvd_2k2k = load_file('checkpoints/model.safetensors', device='cpu')
     state_dict = unet.state_dict()
     for k, v in ckpt_mvd_2k2k.items():
         if k in state_dict: 
@@ -225,6 +235,26 @@ def main(args):
 
     unet.train()
     unet.requires_grad_(True)
+
+    # PEDICO
+    # STEP ATTUALE: si allena SOLO l'adapter layer custom (fusione RGB+depth+normal, 7->3 canali).
+    # Tutta la unet (compreso image_embed) resta congelata.
+    # STEP FUTURO: qui si sbloccheranno anche i primi layer della unet originale (es. conv_in) -
+    # per ora lasciamo tutto freezato, come da richiesta.
+    unet.eval()
+    unet.requires_grad_(False)
+    print("--- ELENCO PARAMETRI DISPONIBILI NELLA UNET (tutti congelati in questo step) ---")
+    for name, _ in unet.named_parameters():
+        print(f"Disponibile: {name}")
+    print("-----------------------------------------------")
+
+    # Adapter layer custom: fonde RGB (3) + depth (1) + normal (3) = 7 canali in 3,
+    # cosi' da poter alimentare CLIP image_encoder e VAE con un'unica immagine "arricchita".
+    # E' l'UNICO modulo allenabile in questo step.
+    adapter_layer = nn.Conv2d(7, 3, kernel_size=3, padding=1)
+    adapter_layer.train()
+    adapter_layer.requires_grad_(True)
+    print(f"- Adapter layer creato (7->3 canali), parametri allenabili: {sum(p.numel() for p in adapter_layer.parameters())}")
 
     if args.use_ema:
         ema_unet = EMAModel(unet.parameters(), model_cls=MultiViewUNetModel, model_config=unet.config)
@@ -268,11 +298,20 @@ def main(args):
     else:
         optimizer_class = torch.optim.AdamW
 
+    # PEDICO
+    # Optimizer agganciato SOLO all'adapter layer (unico modulo con requires_grad=True in questo step)
+    params_da_addestrare = [p for p in adapter_layer.parameters() if p.requires_grad]
+    print(f"Optimizer agganciato all'adapter layer ({len(params_da_addestrare)} tensori di parametri)")
+
+    if len(params_da_addestrare) == 0:
+        raise ValueError("Nessun parametro con gradiente attivo trovato per l'adapter layer!")
+
     optimizer = optimizer_class(
-        [{"params": unet.parameters(), "lr": args.learning_rate}],
+        params_da_addestrare,
+        lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon
+        eps=args.adam_epsilon,
     )
 
     def print_model_info(model):
@@ -287,20 +326,96 @@ def main(args):
     print_model_info(vae)
     print_model_info(image_encoder)
 
-    from core.options import Options
-    opt = Options()
+    # PEDICO
+    class OptAdapter:
+        def __init__(self, argparse_args):
+            self.num_views = getattr(argparse_args, 'num_views', 4)
+            self.num_input_views = getattr(argparse_args, 'num_input_views', 4)
+            self.input_size = getattr(argparse_args, 'input_size', 256)
+            self.output_size = getattr(argparse_args, 'output_size', 512)
+            self.prob_grid_distortion = getattr(argparse_args, 'prob_grid_distortion', 0.0)
+            self.prob_cam_jitter = getattr(argparse_args, 'prob_cam_jitter', 0.0)
+            self.fovy = getattr(argparse_args, 'fovy', 30.0)
+            self.zfar = getattr(argparse_args, 'zfar', 100.0)
+            self.znear = getattr(argparse_args, 'znear', 0.01)
+            self.cam_radius = getattr(argparse_args, 'cam_radius', 4.0)
 
-    # please specify MVRendering path here
-    base_path = './rendering_data'
-    render_path = [
-        'ImagedreamLGM_thuman2_132view', 
+    opt = OptAdapter(args)
+
+
+
+    # =======================================================================
+    #   configurazione dataset
+    # =======================================================================
+
+
+    try:
+        token = userdata.get('HF_TOKEN')
+    except Exception:
+        token = None 
+
+    repo_id = "siiimo/tesiMagistrale"
+
+    
+    cartelle_target = [
+        "00122_Inner_Take8_mesh-f00150",
+        "00122_Outer_Take11_mesh-f00065",
+        "00123_Inner_Take7_mesh-f00115"
     ]
 
-    train_dataset_list = []
-    for idx, path in enumerate(render_path):
-        train_dataset_list.append(Imagedream_LGM_dataset(os.path.join(base_path, path), opt=opt, training=True, white_bg=True))
+    print("-> Recupero la lista dei file remoti da Hugging Face...")
+    tutti_i_file = list_repo_files(repo_id=repo_id, repo_type="dataset", token=token)
 
-    train_dataset = torch.utils.data.ConcatDataset(train_dataset_list)
+    # identificazione campioni validi
+    file_rgb = [
+        f for f in tutti_i_file
+        if any(f.startswith(cartella) for cartella in cartelle_target) and "rgb_" in f
+    ]
+
+    print("-> Scarico/Sincronizzo le cartelle selezionate in locale (Download Parallelo)...")
+    allow_patterns = [f"{cartella}/*" for cartella in cartelle_target]
+    
+    # snapshot_download 
+    local_dataset_root = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        token=token,
+        allow_patterns=allow_patterns,
+        local_files_only=False
+    )
+    print(f"-> Dataset sincronizzato nella cartella locale: {local_dataset_root}")
+
+    # ricostruzione quadruple
+    quadruple_locali = []
+    for rgb_path in file_rgb:
+        cartella_rel, nome_file = os.path.split(rgb_path)
+        id_campione = nome_file.replace("rgb_", "").replace(".png", "")
+
+        quadruple_locali.append({
+            "id": id_campione,
+            "rgb": os.path.join(local_dataset_root, rgb_path),
+            "matrix": os.path.join(local_dataset_root, cartella_rel, f"{id_campione}_RT.txt"),
+            "depth": os.path.join(local_dataset_root, cartella_rel, f"depth_{id_campione}.png"),
+            "normal": os.path.join(local_dataset_root, cartella_rel, f"normal_{id_campione}.png"),
+
+            "cartella_origine": os.path.join(local_dataset_root, cartella_rel)
+        })
+
+    print(f"-> Mappate con successo {len(quadruple_locali)} quadruple locali.")
+
+    # splitting dataset
+    train_paths, resto_paths = train_test_split(quadruple_locali, test_size=0.30, random_state=42, shuffle=True)
+    val_paths, test_paths = train_test_split(resto_paths, test_size=0.50, random_state=42, shuffle=True)
+
+    print(f"-> Distribuzione finale pronti al training:\n   - Train: {len(train_paths)} | - Val: {len(val_paths)}")
+
+
+    train_dataset = Imagedream_LGM_dataset(
+        lista_quadruple=train_paths,
+        opt=opt, 
+        training=True, 
+        white_bg=True
+    )
     
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
@@ -313,7 +428,7 @@ def main(args):
     pct_start = 0.005
     scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.learning_rate, total_steps=total_steps, pct_start=pct_start)
 
-    unet, optimizer, train_dataloader, scheduler = accelerator.prepare(unet, optimizer, train_dataloader, scheduler)
+    unet, adapter_layer, optimizer, train_dataloader, scheduler = accelerator.prepare(unet, adapter_layer, optimizer, train_dataloader, scheduler)
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
@@ -396,7 +511,7 @@ def main(args):
         loss_epoch = 0.0
         num_train_elems = 0
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
+            with accelerator.accumulate(adapter_layer):
                 batch_size = batch['imagedream_images_gt'].shape[0]
                 num_view = batch['imagedream_images_gt'].shape[1]
                 actual_num_frames = num_view + 1
@@ -406,6 +521,18 @@ def main(args):
                 input_image = batch["context_image"].squeeze(dim=1).to(dtype=weight_dtype)
                 gt_pose = batch["imagedream_cam_poses_gt"].to(dtype=weight_dtype)
                 text_prompt = "" + ", 3d asset photorealistic human scan"
+
+                # PEDICO: fusione RGB + depth + normal (7 canali) -> 3 canali,
+                # tramite l'unico modulo allenabile in questo step.
+                context_depth = batch["context_depth"].squeeze(dim=1).to(dtype=weight_dtype)
+                context_normal = batch["context_normal"].squeeze(dim=1).to(dtype=weight_dtype)
+                fused_input = torch.cat([input_image, context_depth, context_normal], dim=1)  # (B, 7, H, W)
+                fused_context_image = adapter_layer(fused_input)
+                fused_context_image = torch.clamp(fused_context_image, -1.0, 1.0)
+                # PEDICO fix: l'output dell'adapter (pesi fp32) va ricastato esplicitamente
+                # a weight_dtype, senza affidarsi all'autocast implicito - stessa logica
+                # usata per ogni altro tensore in questo script.
+                fused_context_image = fused_context_image.to(dtype=weight_dtype)
 
                 gt_image = einops.rearrange(gt_image, "b n c h w -> (b n) c h w")
                 gt_pose = einops.rearrange(gt_pose, "b n x y -> (b n) x y")
@@ -427,7 +554,7 @@ def main(args):
                     random_color_input_image = random_color_input_image.reshape(1, 3, 1, 1)
                     random_color_input_image = random_color_input_image.repeat(batch_size, 1, args.resolution, args.resolution)
 
-                    new_image_after_dropout = torch.where(prompt_mask_img, random_color_input_image, input_image)
+                    new_image_after_dropout = torch.where(prompt_mask_img, random_color_input_image, fused_context_image)
 
                     image_clip = CLIP_preprocess(new_image_after_dropout)
                     image_clip_embedding = image_encoder(image_clip, output_hidden_states=True).hidden_states[-2]
@@ -483,7 +610,7 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = itertools.chain(unet.parameters(), image_encoder.parameters())
+                    params_to_clip = adapter_layer.parameters()
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
@@ -550,6 +677,13 @@ def main(args):
                 )
         pipeline_save_path = os.path.join(args.output_dir, f"pipeline-{global_step}")
         pipeline.save_pretrained(pipeline_save_path)
+
+        # PEDICO: l'adapter layer non e' un componente della ImageDreamPipeline,
+        # quindi va salvato esplicitamente a parte.
+        adapter_layer_unwrapped = accelerator.unwrap_model(adapter_layer)
+        adapter_ckpt_path = os.path.join(pipeline_save_path, "adapter_layer.pt")
+        torch.save(adapter_layer_unwrapped.state_dict(), adapter_ckpt_path)
+        logger.info(f"Adapter layer salvato in {adapter_ckpt_path}")
 
         if args.push_to_hub:
             upload_folder(
