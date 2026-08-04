@@ -18,9 +18,18 @@ def main():
 
     # Prepare dataset and dataloader
     opt = Options()
-    context_image_path = [os.path.join(args.test_imgs, i) for i in os.listdir(args.test_imgs)]
+    
+    # --- PEDICO: Uniformato il filtro dei file in ingresso come in infer.py ---
+    all_files = os.listdir(args.test_imgs)
+    context_image_path = [
+        os.path.join(args.test_imgs, i) for i in all_files 
+        if not (i.endswith("_depth.png") or i.endswith("_normal.png") or i.endswith("_depth.jpg") or i.endswith("_normal.jpg"))
+    ]
+    
     test_dataset = joint_diffusion_inference_dataset(opt, context_image_path, white_bg=True)
     test_dataloader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
+
+    print("Number of samples (Objects to process for mesh): ", len(test_dataset))
 
     save_dir = args.output
 
@@ -29,15 +38,21 @@ def main():
         dataset_name = batch['dataset'][0]
         subject_name = batch['subject_name'][0]
 
-        print(f"Processing {dataset_name} - {subject_name}")
+        print(f"Processing Mesh for {dataset_name} - {subject_name}")
 
         subject_save_folder = os.path.join(save_dir, subject_name)
 
-        if os.path.exists(subject_save_folder + '/gs.ply'):
-            if args.mesh_quality == 'None' or os.path.exists(os.path.join(subject_save_folder, 'tsdf-rgbd.ply')):
-                print(f"{dataset_name} - {subject_name} already processed, skipping")
-                continue
+        # Controlliamo se esiste il modello generato da infer.py (gs.ply)
+        if not os.path.exists(os.path.join(subject_save_folder, 'gs.ply')):
+            print(f"[ATTENZIONE] File gs.ply mancante in {subject_save_folder}. Esegui prima infer.py per questo soggetto. Salto...")
+            continue
 
+        # Se la mesh esiste già o l'utente ha impostato 'None', saltiamo l'oggetto
+        if args.mesh_quality == 'None' or os.path.exists(os.path.join(subject_save_folder, 'tsdf-rgbd.ply')):
+            print(f"{dataset_name} - {subject_name} mesh already processed or quality is None, skipping")
+            continue
+
+        # Generazione della mesh partendo dal gs.ply presente nella cartella
         if args.mesh_quality != 'None':
             generate_tsdf_mesh(subject_save_folder, os.path.join(args.checkpoints, 'pifuhd.pt'), quality=args.mesh_quality)
 
