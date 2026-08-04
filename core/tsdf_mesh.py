@@ -1,4 +1,3 @@
-###############################
 import numpy as np
 
 import torch
@@ -19,14 +18,14 @@ import os
 
 class GaussianRenderer:
     def __init__(self):
-        
+
         self.output_size = 512
         self.fovy = 49.1
         self.znear = 0.5
         self.zfar = 2.5
 
         self.bg_color = torch.tensor([1, 1, 1], dtype=torch.float32, device="cuda")
-        
+
         self.tan_half_fov = np.tan(0.5 * np.deg2rad(self.fovy))
         self.proj_matrix = torch.zeros(4, 4, dtype=torch.float32)
         self.proj_matrix[0, 0] = 1 / self.tan_half_fov
@@ -34,7 +33,7 @@ class GaussianRenderer:
         self.proj_matrix[2, 2] = (self.zfar + self.znear) / (self.zfar - self.znear)
         self.proj_matrix[3, 2] = - (self.zfar * self.znear) / (self.zfar - self.znear)
         self.proj_matrix[2, 3] = 1
-        
+
     def render(self, gaussians, cam_view, cam_view_proj, cam_pos, bg_color=None, sub_pixel_offset=None, scale_modifier=1.0):
         device = gaussians.device
         B, V = cam_view.shape[:2]
@@ -44,17 +43,17 @@ class GaussianRenderer:
         depths = []
         masks = []
         distortions = []
-      
+
         for b in range(B):
 
             means3D = gaussians[b, :, 0:3].contiguous().float()
             opacity = gaussians[b, :, 3:4].contiguous().float()
             scales = gaussians[b, :, 4:7].contiguous().float()
             rotations = gaussians[b, :, 7:11].contiguous().float()
-            rgbs = gaussians[b, :, 11:].contiguous().float() 
+            rgbs = gaussians[b, :, 11:].contiguous().float()
 
             for v in range(V):
-                
+
                 view_matrix = cam_view[b, v].float()
                 view_proj_matrix = cam_view_proj[b, v].float()
                 campos = cam_pos[b, v].float()
@@ -112,9 +111,9 @@ class GaussianRenderer:
         return {
             "image": images,
             "normal": normals,
-            "depth": depths, 
+            "depth": depths,
             "mask": masks,
-            "distortion": distortions 
+            "distortion": distortions
         }
 
     def integrate(self, points3D, gaussians, cam_view, cam_view_proj, cam_pos, bg_color=None, sub_pixel_offset=None, scale_modifier=1.0):
@@ -137,10 +136,10 @@ class GaussianRenderer:
             opacity = gaussians[b, :, 3:4].contiguous().float()
             scales = gaussians[b, :, 4:7].contiguous().float()
             rotations = gaussians[b, :, 7:11].contiguous().float()
-            rgbs = gaussians[b, :, 11:].contiguous().float() 
+            rgbs = gaussians[b, :, 11:].contiguous().float()
 
             for v in range(V):
-                
+
                 view_matrix = cam_view[b, v].float()
                 view_proj_matrix = cam_view_proj[b, v].float()
                 campos = cam_pos[b, v].float()
@@ -203,33 +202,33 @@ class GaussianRenderer:
         color_integrated_all = torch.stack(color_integrated_all, dim=0)
 
         return {
-            "image": images, 
+            "image": images,
             "normal": normals,
-            "depth": depths, 
-            "mask": masks, 
+            "depth": depths,
+            "mask": masks,
             "distortion": distortions,
-            'alpha_integrated': alpha_integrated_all, 
+            'alpha_integrated': alpha_integrated_all,
             'color_integrated': color_integrated_all,
         }
-    
+
 
     @torch.no_grad()
     def evaluate_alpha(self, points, gaussians, cam_view, cam_view_proj, cam_pos):
         final_alpha = torch.ones((points.shape[0]), dtype=torch.float32, device="cuda")
-        bg_color = torch.ones(3, dtype=torch.float32, device=gaussians.device) 
+        bg_color = torch.ones(3, dtype=torch.float32, device=gaussians.device)
 
         with torch.no_grad():
             ret = self.integrate(points, gaussians, cam_view, cam_view_proj, cam_pos, bg_color)
             alpha_integrated = ret["alpha_integrated"]
-            alpha_integrated = alpha_integrated.squeeze(0) 
+            alpha_integrated = alpha_integrated.squeeze(0)
             for viewidx in range(alpha_integrated.shape[0]):
-                alpha_integrated_view = alpha_integrated[viewidx] 
-                final_alpha = torch.min(final_alpha, alpha_integrated_view) 
+                alpha_integrated_view = alpha_integrated[viewidx]
+                final_alpha = torch.min(final_alpha, alpha_integrated_view)
             alpha = 1 - final_alpha
         return alpha
 
     @staticmethod
-    def alpha_to_sdf(alpha):    
+    def alpha_to_sdf(alpha):
         sdf = alpha - 0.5
         sdf = sdf[None]
         return sdf
@@ -246,16 +245,16 @@ class GaussianRenderer:
         gaussians_rotation = gaussians[0, :, 7:11]
         gaussians_xyz = gaussians[0, :, 0:3]
         gaussians_scaling = gaussians[0, :, 4:7]
-        
-        points, points_scale = get_tetra_points(gaussians_rotation, gaussians_xyz, gaussians_scaling) 
-        cells = cpp.triangulate(points)                                                          
-        
+
+        points, points_scale = get_tetra_points(gaussians_rotation, gaussians_xyz, gaussians_scaling)
+        cells = cpp.triangulate(points)
+
         alpha = self.evaluate_alpha(points, gaussians, cam_view, cam_view_proj, cam_pos)
 
-        vertices = points.cuda()[None] 
+        vertices = points.cuda()[None]
         tets = cells.cuda().long()
 
-        print(vertices.shape, tets.shape, alpha.shape) 
+        print(vertices.shape, tets.shape, alpha.shape)
 
         sdf = self.alpha_to_sdf(alpha)
 
@@ -265,10 +264,10 @@ class GaussianRenderer:
 
         end_points, end_sdf = verts_list[0]
         end_scales = scale_list[0]
-        
+
         faces=faces_list[0].cpu().numpy()
         points = (end_points[:, 0, :] + end_points[:, 1, :]) / 2.
-            
+
         left_points = end_points[:, 0, :]
         right_points = end_points[:, 1, :]
         left_sdf = end_sdf[:, 0, :]
@@ -291,25 +290,25 @@ class GaussianRenderer:
             right_sdf[~ind_low] = mid_sdf[~ind_low]
             left_points[ind_low.flatten()] = mid_points[ind_low.flatten()]
             right_points[~ind_low.flatten()] = mid_points[~ind_low.flatten()]
-        
+
             points = (left_points + right_points) / 2
             if step not in [n_binary_steps-1]:
                 continue
 
         return points, faces
-    
+
 
     def save_ply(self, gaussians, path, compatible=True):
 
         assert gaussians.shape[0] == 1, 'only support batch size 1'
 
         from plyfile import PlyData, PlyElement
-     
+
         means3D = gaussians[0, :, 0:3].contiguous().float()
         opacity = gaussians[0, :, 3:4].contiguous().float()
         scales = gaussians[0, :, 4:7].contiguous().float()
         rotations = gaussians[0, :, 7:11].contiguous().float()
-        shs = gaussians[0, :, 11:].unsqueeze(1).contiguous().float() 
+        shs = gaussians[0, :, 11:].unsqueeze(1).contiguous().float()
 
         mask = opacity.squeeze(-1) >= 0.005
         means3D = means3D[mask]
@@ -346,7 +345,7 @@ class GaussianRenderer:
         el = PlyElement.describe(elements, 'vertex')
 
         PlyData([el]).write(path)
-    
+
     def load_ply(self, path, compatible=True):
 
         from plyfile import PlyData, PlyElement
@@ -374,9 +373,9 @@ class GaussianRenderer:
         rots = np.zeros((xyz.shape[0], len(rot_names)))
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
-          
+
         gaussians = np.concatenate([xyz, opacities, scales, rots, shs], axis=1)
-        gaussians = torch.from_numpy(gaussians).float() 
+        gaussians = torch.from_numpy(gaussians).float()
 
         if compatible:
             gaussians[..., 3:4] = torch.sigmoid(gaussians[..., 3:4])
@@ -387,11 +386,11 @@ class GaussianRenderer:
 
 
 class GlobalGenerator(nn.Module):
-    def __init__(self, input_nc, output_nc, ngf=64, n_downsampling=3, n_blocks=9, norm_layer=nn.BatchNorm2d, 
+    def __init__(self, input_nc, output_nc, ngf=64, n_downsampling=3, n_blocks=9, norm_layer=nn.BatchNorm2d,
                  padding_type='reflect', last_op=nn.Tanh()):
         assert(n_blocks >= 0)
-        super(GlobalGenerator, self).__init__()        
-        activation = nn.ReLU(True)        
+        super(GlobalGenerator, self).__init__()
+        activation = nn.ReLU(True)
 
         model = [nn.ReflectionPad2d(3), nn.Conv2d(input_nc, ngf, kernel_size=7, padding=0), norm_layer(ngf), activation]
 
@@ -403,19 +402,19 @@ class GlobalGenerator(nn.Module):
         mult = 2**n_downsampling
         for i in range(n_blocks):
             model += [ResnetBlock(ngf * mult, padding_type=padding_type, activation=activation, norm_layer=norm_layer)]
-            
+
         for i in range(n_downsampling):
             mult = 2**(n_downsampling - i)
             model += [nn.ConvTranspose2d(ngf * mult, int(ngf * mult / 2), kernel_size=3, stride=2, padding=1, output_padding=1),
                        norm_layer(int(ngf * mult / 2)), activation]
         model += [nn.ReflectionPad2d(3), nn.Conv2d(ngf, output_nc, kernel_size=7, padding=0)]
         if last_op is not None:
-            model += [last_op]        
+            model += [last_op]
         self.model = nn.Sequential(*model)
-            
+
     def forward(self, input):
-        return self.model(input)             
-        
+        return self.model(input)
+
 class ResnetBlock(nn.Module):
     def __init__(self, dim, padding_type, norm_layer, activation=nn.ReLU(True), use_dropout=False):
         super(ResnetBlock, self).__init__()
@@ -474,17 +473,18 @@ def get_normal_estimator(state_dict_path):
             ])
 
     print('Resuming from ', state_dict_path)
-    ckpt = torch.load(state_dict_path, map_location='cpu')    
+    ckpt = torch.load(state_dict_path, map_location='cpu', weights_only=False)
 
-    netG = GlobalGenerator(input_nc=3, output_nc=3, ngf=64, n_downsampling=4, n_blocks=9, last_op=nn.Tanh())  
+
+    netG = GlobalGenerator(input_nc=3, output_nc=3, ngf=64, n_downsampling=4, n_blocks=9, last_op=nn.Tanh())
     netG = netG.cuda()
 
     state_dict = netG.state_dict()
 
     for k, v in ckpt['model_state_dict'].items():
-        if k[10:] in state_dict: 
+        if k[10:] in state_dict:
             if k[:10] == 'netG.netF.':
-                if state_dict[k[10:]].shape == v.shape: 
+                if state_dict[k[10:]].shape == v.shape:
                     state_dict[k[10:]].copy_(v)
                 else:
                     pass
@@ -503,14 +503,14 @@ from PIL import Image
 import cv2
 import matplotlib.pyplot as plt
 
-def move_left(mask): return np.pad(mask,((0,0),(0,1)),'constant',constant_values=0)[:,1:]  
-def move_right(mask): return np.pad(mask,((0,0),(1,0)),'constant',constant_values=0)[:,:-1]  
-def move_top(mask): return np.pad(mask,((0,1),(0,0)),'constant',constant_values=0)[1:,:] 
-def move_bottom(mask): return np.pad(mask,((1,0),(0,0)),'constant',constant_values=0)[:-1,:] 
-def move_top_left(mask): return np.pad(mask,((0,1),(0,1)),'constant',constant_values=0)[1:,1:]  
-def move_top_right(mask): return np.pad(mask,((0,1),(1,0)),'constant',constant_values=0)[1:,:-1]  
-def move_bottom_left(mask): return np.pad(mask,((1,0),(0,1)),'constant',constant_values=0)[:-1,1:]  
-def move_bottom_right(mask): return np.pad(mask,((1,0),(1,0)),'constant',constant_values=0)[:-1,:-1]  
+def move_left(mask): return np.pad(mask,((0,0),(0,1)),'constant',constant_values=0)[:,1:]
+def move_right(mask): return np.pad(mask,((0,0),(1,0)),'constant',constant_values=0)[:,:-1]
+def move_top(mask): return np.pad(mask,((0,1),(0,0)),'constant',constant_values=0)[1:,:]
+def move_bottom(mask): return np.pad(mask,((1,0),(0,0)),'constant',constant_values=0)[:-1,:]
+def move_top_left(mask): return np.pad(mask,((0,1),(0,1)),'constant',constant_values=0)[1:,1:]
+def move_top_right(mask): return np.pad(mask,((0,1),(1,0)),'constant',constant_values=0)[1:,:-1]
+def move_bottom_left(mask): return np.pad(mask,((1,0),(0,1)),'constant',constant_values=0)[:-1,1:]
+def move_bottom_right(mask): return np.pad(mask,((1,0),(1,0)),'constant',constant_values=0)[:-1,:-1]
 
 def generate_dx_dy(mask, nz_horizontal, nz_vertical, step_size=1):
     num_pixel = np.sum(mask)
@@ -563,7 +563,7 @@ def bilateral_normal_integration_depth(normal_map,
                                         tol=1e-4,
                                         cg_max_iter=5000,
                                         cg_tol=1e-3):
-    
+
     K = np.array([
             [5.604441528320312500e+02, 0.000000000000000000e+00, 2.560000000000000000e+02],
             [0.000000000000000000e+00, 5.604441528320312500e+02, 2.560000000000000000e+02],
@@ -622,9 +622,9 @@ def bilateral_normal_integration_depth(normal_map,
             A_mat += lambda1 * M
             b_vec += lambda1 * M @ z_prior
 
-        D = spdiags(1/np.clip(A_mat.diagonal(), 1e-5, None), 0, num_normals, num_normals, format="csr")  
+        D = spdiags(1/np.clip(A_mat.diagonal(), 1e-5, None), 0, num_normals, num_normals, format="csr")
 
-        z, _ = cg(A_mat, b_vec, x0=z, M=D, maxiter=cg_max_iter, tol=cg_tol)
+        z, _ = cg(A_mat, b_vec, x0=z, M=D, maxiter=cg_max_iter, rtol=cg_tol)
 
         wu = sigmoid((A2 @ z) ** 2 - (A1 @ z) ** 2, k)
         wv = sigmoid((A4 @ z) ** 2 - (A3 @ z) ** 2, k)
@@ -636,7 +636,7 @@ def bilateral_normal_integration_depth(normal_map,
         relative_energy = np.abs(energy - energy_old) / energy_old
         if relative_energy < tol:
             break
-    
+
     depth_map_refined = np.ones_like(normal_mask, float) * np.nan
     depth_map_refined[normal_mask] = z
 
@@ -660,7 +660,7 @@ class TSDFVolume:
 
     self._vol_bnds = vol_bnds
     self._voxel_size = float(voxel_size)
-    self._trunc_margin = 5 * self._voxel_size  
+    self._trunc_margin = 5 * self._voxel_size
     self._color_const = 256 * 256
 
     self._vol_dim = np.ceil((self._vol_bnds[:,1]-self._vol_bnds[:,0])/self._voxel_size).copy(order='C').astype(int)
@@ -824,7 +824,7 @@ class TSDFVolume:
     color_im = color_im.astype(np.float32)
     color_im = np.floor(color_im[...,2] * 256 * 256 + color_im[...,1] * 256 + color_im[...,0])
 
-    if self.gpu_mode: 
+    if self.gpu_mode:
       for gpu_loop_idx in range(self._n_gpu_loops):
         self._cuda_integrate(self._tsdf_vol_gpu,
                             self._weight_vol_gpu,
@@ -850,7 +850,7 @@ class TSDFVolume:
                               int(self._max_gpu_grid_dim[2]),
                             )
         )
-    else: 
+    else:
       cam_pts = self.vox2world(self._vol_origin, self.vox_coords, self._voxel_size)
       cam_pts = rigid_transform(cam_pts, np.linalg.inv(cam_pose))
       pix_z = cam_pts[:, 2]
@@ -921,7 +921,7 @@ class TSDFVolume:
 
     verts, faces, norms, vals = measure.marching_cubes(tsdf_vol, level=0)
     verts_ind = np.round(verts).astype(int)
-    verts = verts*self._voxel_size+self._vol_origin  
+    verts = verts*self._voxel_size+self._vol_origin
 
     rgb_vals = color_vol[verts_ind[:,0], verts_ind[:,1], verts_ind[:,2]]
     colors_b = np.floor(rgb_vals/self._color_const)
@@ -987,7 +987,7 @@ def generate_tsdf_mesh(subj_base_path, normal_checkpoint_path, quality='high'):
 
     netG, to_tensor = get_normal_estimator(normal_checkpoint_path)
     if quality == 'high':
-        voxel_size, obs_weight = 0.001, 1.0 
+        voxel_size, obs_weight = 0.001, 1.0
     elif quality == 'low':
         voxel_size, obs_weight = 0.003, 1.0
 
@@ -999,9 +999,9 @@ def generate_tsdf_mesh(subj_base_path, normal_checkpoint_path, quality='high'):
     gaussians = gof.load_ply(subj_base_path + '/gs.ply').unsqueeze(0).cuda()
     bg_color = torch.ones(3, dtype=torch.float32, device=gaussians.device)
 
-    blender2opengl = torch.tensor([[1, 0, 0, 0], 
-                                    [0, 0, 1, 0], 
-                                    [0, -1, 0, 0], 
+    blender2opengl = torch.tensor([[1, 0, 0, 0],
+                                    [0, 0, 1, 0],
+                                    [0, -1, 0, 0],
                                     [0, 0, 0, 1]]).cuda().float()
 
     K = np.array([5.604441528320312500e+02, 0.000000000000000000e+00, 2.560000000000000000e+02,
@@ -1012,12 +1012,12 @@ def generate_tsdf_mesh(subj_base_path, normal_checkpoint_path, quality='high'):
                                 0.000000000000000000e+00, 1.000000000000000000e+00, 0.000000000000000000e+00, 0.000000000000000000e+00,
                                 0.000000000000000000e+00, 0.000000000000000000e+00, 0.000000000000000000e+00, 1.000000000000000000e+00]).reshape((4, 4)).astype(np.float32)
 
-    front_view_c2w_opengl = blender2opengl@torch.from_numpy(front_view_c2w).cuda() 
-    transform_rel_front = torch.tensor([[1, 0, 0, 0], 
-                                        [0, 1, 0, 0], 
-                                        [0, 0, 1, 1.5], 
+    front_view_c2w_opengl = blender2opengl@torch.from_numpy(front_view_c2w).cuda()
+    transform_rel_front = torch.tensor([[1, 0, 0, 0],
+                                        [0, 1, 0, 0],
+                                        [0, 0, 1, 1.5],
                                         [0, 0, 0, 1]], dtype=torch.float32).cuda() @ torch.inverse(front_view_c2w_opengl)
-    
+
     if quality == 'high':
         view_total = 72
     elif quality == 'low':
@@ -1031,14 +1031,14 @@ def generate_tsdf_mesh(subj_base_path, normal_checkpoint_path, quality='high'):
         view_base_path = os.path.join(subj_base_path, f'{view_idx}_tsdf')
         elevation = ELEVATION[view_idx]
         azimuth = AZIMUTH[view_idx]
-        
+
         camera_matrix = create_camera_to_world_matrix(elevation, azimuth, 1.5)
         c2w_orig = convert_opengl_to_blender(camera_matrix)
 
         c2w_opengl = blender2opengl@torch.from_numpy(c2w_orig).cuda().float()
         c2w_opengl = transform_rel_front@c2w_opengl
         c2w_opengl[:3, 1:3] *= -1
-        cam_view_gof = torch.inverse(c2w_opengl).unsqueeze(0).transpose(1, 2).unsqueeze(0).cuda() 
+        cam_view_gof = torch.inverse(c2w_opengl).unsqueeze(0).transpose(1, 2).unsqueeze(0).cuda()
         cam_view_proj_gof = (cam_view_gof @ proj_matrix).cuda()
         cam_pos_gof = c2w_opengl[:3, 3].unsqueeze(0).unsqueeze(0).cuda()
 
@@ -1057,8 +1057,8 @@ def generate_tsdf_mesh(subj_base_path, normal_checkpoint_path, quality='high'):
         img_pifuhd = rgb_img_org[..., :3]
         mask_pifuhd = mask_img_org
 
-        img_pifuhd = img_pifuhd * mask_img_org[..., None] 
-        img_pifuhd = to_tensor(img_pifuhd).unsqueeze(0).cuda() 
+        img_pifuhd = img_pifuhd * mask_img_org[..., None]
+        img_pifuhd = to_tensor(img_pifuhd).unsqueeze(0).cuda()
 
         normal_estimate = netG.forward(img_pifuhd).detach()
         normal_estimate = normal_estimate[0].permute(1,2,0).detach().cpu().numpy()
@@ -1083,7 +1083,7 @@ def generate_tsdf_mesh(subj_base_path, normal_checkpoint_path, quality='high'):
 
         ck2can = np.linalg.inv(w2c_comb)
 
-        tsdf_vol.integrate(rgb_image_tsdf, depth_refined, K, ck2can, obs_weight=obs_weight) 
+        tsdf_vol.integrate(rgb_image_tsdf, depth_refined, K, ck2can, obs_weight=obs_weight)
 
     verts, faces, norms, colors = tsdf_vol.get_mesh()
     outfile = os.path.join(subj_base_path, f'tsdf-rgbd.ply')
@@ -1107,4 +1107,3 @@ def generate_tsdf_mesh(subj_base_path, normal_checkpoint_path, quality='high'):
 
     o3d_mesh_smpl = o3d_mesh.simplify_quadric_decimation(500000)
     o3d.io.write_triangle_mesh(outfile, o3d_mesh_smpl)
-
