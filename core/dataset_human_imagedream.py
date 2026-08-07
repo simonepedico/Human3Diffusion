@@ -9,7 +9,9 @@ import torchvision.transforms.functional as TF
 from torch.utils.data import Dataset
 
 from huggingface_hub import hf_hub_download
-from google.colab import userdata
+
+# TOKEN MIO PERSONALE
+HF_TOKEN = os.environ.get("HF_TOKEN", "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")
 
 from core.utils import get_rays
 
@@ -44,7 +46,7 @@ class Imagedream_LGM_dataset(Dataset):
         # DOWNLOAD HUGGINGFACE
         # ***********************************
 
-        self.token = os.environ.get('HF_TOKEN', None)
+        self.token = HF_TOKEN
         self.repo_id = "siiimo/tesiMagistrale"
         self.cache_dir = "dataset_cache_lgm"
 
