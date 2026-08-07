@@ -9,10 +9,14 @@ from tqdm import tqdm
 import einops
 import torch.nn.functional as F
 import shutil
+from typing import Union, List, Optional, Dict 
 
 from huggingface_hub import list_repo_files, snapshot_download
+from huggingface_hub.constants import HF_HUB_CACHE
 from sklearn.model_selection import train_test_split
-from google.colab import userdata
+
+# TOKEN DA TENERE PER ME 
+HF_TOKEN = os.environ.get("HF_TOKEN", "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")
 
 os.environ["WANDB__SERVICE_WAIT"] = "300"
 os.environ["NCCL_P2P_DISABLE"]="1"
@@ -48,6 +52,22 @@ logger = get_logger(__name__)
 if is_wandb_available():
     os.environ["WANDB_MODE"] = "offline"
     import wandb
+
+def get_path_size_str(path: Union[str, Path]) -> str:
+    """Calcola la dimensione di un file o di una cartella e la restituisce formattata."""
+    p = Path(path)
+    if not p.exists():
+        return "0 B"
+    if p.is_file():
+        total_bytes = p.stat().st_size
+    else:
+        total_bytes = sum(f.stat().st_size for f in p.rglob('*') if f.is_file())
+    
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if total_bytes < 1024.0:
+            return f"{total_bytes:.2f} {unit}"
+        total_bytes /= 1024.0
+    return f"{total_bytes:.2f} PB"
 
 # (l'ho messa altrimenti andava in errore)
 def CLIP_preprocess(x):
@@ -349,14 +369,14 @@ def main(args):
     # =======================================================================
 
 
-    try:
-        token = userdata.get('HF_TOKEN')
-    except Exception:
-        token = None 
+    token = HF_TOKEN
 
     repo_id = "siiimo/tesiMagistrale"
 
-    
+    # =======================================================================
+    # SE VUOI SOLO PARTE DEL DATASET
+    # =======================================================================
+    '''
     cartelle_target = [
         "00122_Inner_Take8_mesh-f00150",
         "00122_Outer_Take11_mesh-f00065",
@@ -364,6 +384,7 @@ def main(args):
     ]
 
     print("-> Recupero la lista dei file remoti da Hugging Face...")
+    print("SCARICO SOLO PARTE DEL DATASET")
     tutti_i_file = list_repo_files(repo_id=repo_id, repo_type="dataset", token=token)
 
     # identificazione campioni validi
@@ -372,9 +393,9 @@ def main(args):
         if any(f.startswith(cartella) for cartella in cartelle_target) and "rgb_" in f
     ]
 
-    print("-> Scarico/Sincronizzo le cartelle selezionate in locale (Download Parallelo)...")
+    print("-> Scarico/Sincronizzo le cartelle selezionate in locale...")
     allow_patterns = [f"{cartella}/*" for cartella in cartelle_target]
-    
+
     # snapshot_download 
     local_dataset_root = snapshot_download(
         repo_id=repo_id,
@@ -384,6 +405,37 @@ def main(args):
         local_files_only=False
     )
     print(f"-> Dataset sincronizzato nella cartella locale: {local_dataset_root}")
+    '''
+
+
+    # =======================================================================
+    #   SE VOGLIO TUTTO IL DATASET
+    # =======================================================================
+
+    print("-> Recupero la lista dei file remoti da Hugging Face...")
+    print("SCARICO TUTTO IL DATASET")
+    tutti_i_file = list_repo_files(repo_id=repo_id, repo_type="dataset", token=token)
+
+    # Identifica TUTTI i file RGB presenti nel repository (senza filtrare per cartella)
+    file_rgb = [f for f in tutti_i_file if "rgb_" in f]
+
+    print("-> Scarico/Sincronizzo l'INTERO dataset in locale...")
+
+    dataset_target_dir = os.path.join(HF_HUB_CACHE, f"datasets--{repo_id.replace('/', '--')}")
+    print(f"-> Sto per scaricare/sincronizzare il dataset da HF nella cartella: {dataset_target_dir}")
+
+    # snapshot_download 
+    local_dataset_root = snapshot_download(
+        repo_id=repo_id,
+        repo_type="dataset",
+        token=token,
+        local_files_only=False
+    )
+    print(f"-> Dataset sincronizzato nella cartella locale: {local_dataset_root}")
+
+
+
+    
 
     # ricostruzione quadruple
     quadruple_locali = []
@@ -644,6 +696,7 @@ def main(args):
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
+                        print(f"-> File/Cartella salvato in: {save_path} | Dimensione: {get_path_size_str(save_path)}")
                         logger.info(f"Saved state to {save_path}")
 
                     mem_free, mem_total = torch.cuda.mem_get_info()    
@@ -677,12 +730,14 @@ def main(args):
                 )
         pipeline_save_path = os.path.join(args.output_dir, f"pipeline-{global_step}")
         pipeline.save_pretrained(pipeline_save_path)
+        print(f"-> File/Cartella salvato in: {pipeline_save_path} | Dimensione: {get_path_size_str(pipeline_save_path)}")
 
         # PEDICO: l'adapter layer non e' un componente della ImageDreamPipeline,
         # quindi va salvato esplicitamente a parte.
         adapter_layer_unwrapped = accelerator.unwrap_model(adapter_layer)
         adapter_ckpt_path = os.path.join(pipeline_save_path, "adapter_layer.pt")
         torch.save(adapter_layer_unwrapped.state_dict(), adapter_ckpt_path)
+        print(f"-> File/Cartella salvato in: {adapter_ckpt_path} | Dimensione: {get_path_size_str(adapter_ckpt_path)}")
         logger.info(f"Adapter layer salvato in {adapter_ckpt_path}")
 
         if args.push_to_hub:
