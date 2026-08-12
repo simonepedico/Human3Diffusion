@@ -1,6 +1,11 @@
 import torch
 import torch.nn as nn
 
+# ========================= HIDDEN_DIM DA MODIFICARE ==================
+
+hidden_dim = 32
+
+# ====================================================================
 
 # Ffix diffusers
 if not hasattr(nn.Module, "dtype"):
@@ -92,7 +97,15 @@ def get_2ddiffusion_model(unet2d_dict_path, device, org_imgdream_path="ashawkey/
     # fine-tuning (vedi train_MultiviewDiffusion_diffusion.py). E' l'unico modulo
     # che nel training aveva pesi diversi da quelli del backbone ImageDream originale,
     # quindi va ricreato qui e i suoi pesi vanno caricati per coerenza con l'inferenza.
-    adapter_layer = nn.Conv2d(7, 3, kernel_size=3, padding=1)
+    adapter_layer = nn.Sequential(
+        nn.Conv2d(7, hidden_dim, kernel_size=3, padding=1),
+        nn.ReLU(inplace=True),
+        
+        nn.Conv2d(hidden_dim, 3, kernel_size=3, padding=1),
+        
+        nn.Tanh() 
+    )
+
 
     if adapter_ckpt_path is None:
         # stessa convenzione di salvataggio usata in fase di training: il file

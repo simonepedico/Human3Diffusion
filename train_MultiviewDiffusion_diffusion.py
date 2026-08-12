@@ -15,9 +15,13 @@ from huggingface_hub import list_repo_files, snapshot_download
 from huggingface_hub.constants import HF_HUB_CACHE
 from sklearn.model_selection import train_test_split
 
+# ========================== MODIFICABILE =========================================================
 # TOKEN DA TENERE PER ME 
-HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+HF_TOKEN = os.environ.get("HF_TOKEN", "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")
 
+# PARAMETRO PER IL PRIMO ADAPTER LAYER, CAPIRE SE USARE 32 O 64
+hidden_dim = 64
+# ================================================================================================
 os.environ["WANDB__SERVICE_WAIT"] = "300"
 os.environ["NCCL_P2P_DISABLE"]="1"
 os.environ["NCCL_IB_DISABLE"]="1"
@@ -33,6 +37,8 @@ import diffusers
 from diffusers.utils import is_wandb_available
 from huggingface_hub import create_repo, upload_folder
 import itertools
+
+
 
 from diffusers import (
     AutoencoderKL,
@@ -175,6 +181,7 @@ def _encode_text_prompt(tokenizer, text_encoder, prompt, device, batch_size):
 def main(args):
     args.max_train_steps = None
     args.learning_rate = 1e-4
+    # args.learning_rate = 5e-5
     args.tracker_project_name = "train_mvd_pretrain"
     args.num_gpu = 1
     args.gradient_accumulation_steps = 1
@@ -226,6 +233,7 @@ def main(args):
     feature_extractor = None
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=None)
     unet = MultiViewUNetModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet", revision=None)
+    # print(unet)
 
     print("===========================================")
     print("Load pretrained human Imagedream Unet Model")
@@ -244,6 +252,8 @@ def main(args):
 
     logger.info("Unet Models loaded from MVD pretraining successfully.")
 
+   
+    # ================== GESTIONE CONGELAMENTO/SCONGELAMENTO ==================================
     vae.eval()
     vae.requires_grad_(False)
 
@@ -253,28 +263,61 @@ def main(args):
     text_encoder.eval()
     text_encoder.requires_grad_(False)
 
-    unet.train()
     unet.requires_grad_(True)
+
+    # Encoder
+    for param in unet.input_blocks.parameters():
+        param.requires_grad = True
+
+    # Bottleneck
+    for param in unet.middle_block.parameters():
+        param.requires_grad = True
+
+    # imposto la UNet in modalità train 
+    unet.train()
+
+    # =========================================================================================
+
+        
+    trainable_unet_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    print(f"-> Parametri allenabili sbloccati nella UNet (fino al bottleneck): {trainable_unet_params / 1e6:.2f} M")
 
     # PEDICO
     # STEP ATTUALE: si allena SOLO l'adapter layer custom (fusione RGB+depth+normal, 7->3 canali).
     # Tutta la unet (compreso image_embed) resta congelata.
     # STEP FUTURO: qui si sbloccheranno anche i primi layer della unet originale (es. conv_in) -
     # per ora lasciamo tutto freezato, come da richiesta.
-    unet.eval()
-    unet.requires_grad_(False)
+    # unet.eval()
+    # unet.requires_grad_(False)
     print("--- ELENCO PARAMETRI DISPONIBILI NELLA UNET (tutti congelati in questo step) ---")
     for name, _ in unet.named_parameters():
         print(f"Disponibile: {name}")
     print("-----------------------------------------------")
 
-    # Adapter layer custom: fonde RGB (3) + depth (1) + normal (3) = 7 canali in 3,
-    # cosi' da poter alimentare CLIP image_encoder e VAE con un'unica immagine "arricchita".
-    # E' l'UNICO modulo allenabile in questo step.
-    adapter_layer = nn.Conv2d(7, 3, kernel_size=3, padding=1)
+
+
+
+    # ======================= ADAPTER LAYER ====================================
+
+    adapter_layer = nn.Sequential(
+        nn.Conv2d(7, hidden_dim, kernel_size=3, padding=1),
+        nn.ReLU(inplace=True),
+        
+        nn.Conv2d(hidden_dim, 3, kernel_size=3, padding=1),
+        
+        nn.Tanh() 
+    )
+
     adapter_layer.train()
     adapter_layer.requires_grad_(True)
-    print(f"- Adapter layer creato (7->3 canali), parametri allenabili: {sum(p.numel() for p in adapter_layer.parameters())}")
+
+    num_params = sum(p.numel() for p in adapter_layer.parameters() if p.requires_grad)
+    print(f"- Adapter layer creato (7->{hidden_dim}->3 canali), parametri allenabili: {num_params}")
+
+    # =========================================================================
+
+
+
 
     if args.use_ema:
         ema_unet = EMAModel(unet.parameters(), model_cls=MultiViewUNetModel, model_config=unet.config)
@@ -319,9 +362,17 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # PEDICO
-    # Optimizer agganciato SOLO all'adapter layer (unico modulo con requires_grad=True in questo step)
-    params_da_addestrare = [p for p in adapter_layer.parameters() if p.requires_grad]
-    print(f"Optimizer agganciato all'adapter layer ({len(params_da_addestrare)} tensori di parametri)")
+    unet_trainable_params = [p for p in unet.parameters() if p.requires_grad]
+    adapter_params = [p for p in adapter_layer.parameters() if p.requires_grad]
+
+   
+    params_da_addestrare = [
+        {"params": adapter_params, "lr": args.learning_rate},             
+        {"params": unet_trainable_params, "lr": args.learning_rate * 0.5} 
+    ]
+
+    
+    print(f"Optimizer agganciato all'adapter layer ({len(params_da_addestrare)} tensori di parametri;)")
 
     if len(params_da_addestrare) == 0:
         raise ValueError("Nessun parametro con gradiente attivo trovato per l'adapter layer!")
@@ -476,11 +527,31 @@ def main(args):
         num_workers=1,
     )
 
-    total_steps = args.num_train_epochs * len(train_dataloader) // args.gradient_accumulation_steps
-    pct_start = 0.005
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=args.learning_rate, total_steps=total_steps, pct_start=pct_start)
+    val_dataset = Imagedream_LGM_dataset(
+        lista_quadruple=val_paths,
+        opt=opt, 
+        training=False,  # disabilita le trasformazioni/data augmentation di train
+        white_bg=True
+    )
 
-    unet, adapter_layer, optimizer, train_dataloader, scheduler = accelerator.prepare(unet, adapter_layer, optimizer, train_dataloader, scheduler)
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
+        shuffle=False,   
+        batch_size=args.train_batch_size,
+        num_workers=1,
+    )
+
+
+
+    total_steps = args.num_train_epochs * len(train_dataloader) // args.gradient_accumulation_steps
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps,
+        eta_min=1e-5
+    )
+
+
+    unet, adapter_layer, optimizer, train_dataloader, val_dataloader, scheduler = accelerator.prepare(unet, adapter_layer, optimizer, train_dataloader, val_dataloader, scheduler)
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
@@ -662,7 +733,9 @@ def main(args):
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = adapter_layer.parameters()
+                    #params_to_clip = adapter_layer.parameters()
+                    params_to_clip = list(adapter_layer.parameters()) + [p for p in unet.parameters() if p.requires_grad]
+
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
                 optimizer.step()
                 scheduler.step()
@@ -710,7 +783,9 @@ def main(args):
                     "epoch": epoch}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+            
 
+            
             if global_step >= args.max_train_steps:
                 break
 
