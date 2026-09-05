@@ -93,8 +93,6 @@ class joint_diffusion_inference_dataset(Dataset):
 
         return output_image_torch, output_mask_torch
 
-    
-
     def __getitem__(self, idx):
 
         assert self.num_input_views == 4, "Only 4 input views are supported for this dataset"
@@ -157,46 +155,42 @@ class joint_diffusion_inference_dataset(Dataset):
 
         results['diffusion3d_cam_poses_input_embedding'] = rays_embeddings 
 
-        print("load context image, done remove background, recentered, make white background")
         context_image = context_image_torch
-
         
         context_image_input = F.interpolate(context_image.unsqueeze(0), size=(self.input_size, self.input_size), mode='bilinear', align_corners=False) 
         context_image_input = TF.normalize(context_image_input, self.normalize_mean, self.normalize_std) 
-        
-       
-        # PEDICO: Caricamento e pre-processing di  depth e normals
-        # assumo i percorsi standard es: image.png -> image_depth.png
-        depth_path = rgb_path.replace('.png', '_depth.png')
-        normal_path = rgb_path.replace('.png', '_normal.png')
 
-        # depth maps 
+        # =========================================================================
+        # CARICAMENTO E FORMATTAZIONE MAPPE DEPTH E NORMAL (7 CANALI)
+        # =========================================================================
+        base_path = os.path.splitext(rgb_path)[0]
+        depth_path = f"{base_path}_depth.png"
+        normal_path = f"{base_path}_normal.png"
+
+        # 1. Depth Map (1 canale, normalizzato [-1, 1])
         if os.path.exists(depth_path):
             depth_pil = Image.open(depth_path).convert('L')
             depth_torch = torch.from_numpy(np.array(depth_pil, dtype=np.float32) / 255.0).unsqueeze(0) # [1, H, W]
         else:
-            
             depth_torch = torch.zeros((1, context_image.shape[1], context_image.shape[2]))
         
         depth_input = F.interpolate(depth_torch.unsqueeze(0), size=(self.input_size, self.input_size), mode='bilinear', align_corners=False)
-        depth_input = TF.normalize(depth_input, (0.5,), (0.5,)) # Porta da [0, 1] a [-1, 1]
+        depth_input = TF.normalize(depth_input, (0.5,), (0.5,)) # Range [-1.0, 1.0]
 
-        # 2. normal maps
+        # 2. Normal Map (3 canali, normalizzato [-1, 1])
         if os.path.exists(normal_path):
             normal_pil = Image.open(normal_path).convert('RGB')
             normal_torch = torch.from_numpy(np.array(normal_pil, dtype=np.float32) / 255.0).permute(2, 0, 1) # [3, H, W]
         else:
-           
             normal_torch = torch.zeros((3, context_image.shape[1], context_image.shape[2]))
             
         normal_input = F.interpolate(normal_torch.unsqueeze(0), size=(self.input_size, self.input_size), mode='bilinear', align_corners=False)
-        normal_input = TF.normalize(normal_input, self.normalize_mean, self.normalize_std) # Porta da [0, 1] a [-1, 1]
+        normal_input = TF.normalize(normal_input, self.normalize_mean, self.normalize_std) # Range [-1.0, 1.0]
 
-        
+        # Chiavi standardizzate coerenti con la pipeline e il training
         results['context_image'] = context_image_input
-        results['depth_map'] = depth_input     
-        results['normal_map'] = normal_input 
-        
+        results['context_depth'] = depth_input     
+        results['context_normal'] = normal_input 
 
         context_cam_pos = torch.zeros_like(diffusion3d_cam_poses[0])
         context_ray_o, context_ray_d = get_rays(context_cam_pos, self.input_size, self.input_size, self.fovy)
