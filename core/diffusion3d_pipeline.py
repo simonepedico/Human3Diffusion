@@ -1,13 +1,14 @@
+import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms.functional as TF
+import einops
+from torchvision.utils import make_grid, save_image
+from skimage.io import imsave
+import numpy as np
 
-# ========================= HIDDEN_DIM DA MODIFICARE ==================
-
-hidden_dim = 32
-
-# ====================================================================
-
-# Ffix diffusers
+# Fix diffusers
 if not hasattr(nn.Module, "dtype"):
     def _get_module_dtype(self):
         try:
@@ -17,118 +18,113 @@ if not hasattr(nn.Module, "dtype"):
 
     nn.Module.dtype = property(_get_module_dtype)
 
-
 from mvdream.pipeline_imagedream import ImageDreamPipeline
-from diffusers import (
-    AutoencoderKL,
-    DDIMScheduler,
-    DDPMScheduler,
-)
-
-from transformers import (
-    CLIPTextModel,
-    CLIPVisionModel,
-    CLIPTokenizer,
-)
+from diffusers import AutoencoderKL, DDIMScheduler
+from transformers import CLIPTextModel, CLIPVisionModel, CLIPTokenizer
 from mvdream.mv_unet import MultiViewUNetModel
-
 from safetensors.torch import load_file
-
 
 from core.diffusion3d_imagedream import diffusion3dgs_noise_gof
 from core.options import Options
 
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.transforms.functional as TF
-import einops
-
-
-from torchvision.utils import make_grid, save_image
-import os
-from skimage.io import imsave
-import numpy as np
-
-def get_2ddiffusion_model(unet2d_dict_path, device, org_imgdream_path="ashawkey/imagedream-ipmv-diffusers", adapter_ckpt_path=None):
+def get_2ddiffusion_model(unet2d_dict_path, device, org_imgdream_path="ashawkey/imagedream-ipmv-diffusers", vae_ckpt_path=None):
 
     noise_scheduler = DDIMScheduler.from_pretrained(org_imgdream_path, subfolder="scheduler", revision=None) 
     image_encoder = CLIPVisionModel.from_pretrained(org_imgdream_path, subfolder="image_encoder", revision=None)
     text_encoder = CLIPTextModel.from_pretrained(org_imgdream_path, subfolder="text_encoder", revision=None)
     tokenizer = CLIPTokenizer.from_pretrained(org_imgdream_path, subfolder="tokenizer", revision=None)
-    feature_extractor = None 
     vae = AutoencoderKL.from_pretrained(org_imgdream_path, subfolder="vae", revision=None)
     unet = MultiViewUNetModel.from_pretrained(org_imgdream_path, subfolder="unet", revision=None)
 
-    # load 2d unet model
-    ckpt_mvd = load_file(unet2d_dict_path, device='cpu')
-    state_dict = unet.state_dict()
-    for k, v in ckpt_mvd.items():
-        if k in state_dict: 
-            if state_dict[k].shape == v.shape:
-                state_dict[k].copy_(v)
-            else:
-                print(f'[WARN] mismatching shape for param {k}: ckpt {v.shape} != model {state_dict[k].shape}, ignored.')
-        else:
-            print(f'[WARN] unexpected param {k}: {v.shape}')
-    print("############# MVD models loaded #############")
-    
-    pipe = ImageDreamPipeline(
-                            vae=vae,
-                            unet=unet,
-                            image_encoder=image_encoder,
-                            tokenizer=tokenizer,
-                            text_encoder=text_encoder,
-                            scheduler=noise_scheduler,
-                        )
+    # =========================================================================
+    # MODIFICA VAE: ESPANSIONE PRIMO LAYER DA 3 A 7 CANALI
+    # =========================================================================
+    old_conv = vae.encoder.conv_in
+    new_conv = nn.Conv2d(
+        in_channels=7,
+        out_channels=old_conv.out_channels,
+        kernel_size=old_conv.kernel_size,
+        stride=old_conv.stride,
+        padding=old_conv.padding,
+        bias=(old_conv.bias is not None)
+    )
+    vae.encoder.conv_in = new_conv
+
+    # =========================================================================
+    # CARICAMENTO CHECKPOINT (UNET + VAE FINE-TUNATO)
+    # =========================================================================
+    if os.path.isdir(unet2d_dict_path):
+        pipe = ImageDreamPipeline.from_pretrained(unet2d_dict_path)
+    else:
+        # 1. Caricamento pesi UNet
+        if os.path.exists(unet2d_dict_path):
+            ckpt_mvd = load_file(unet2d_dict_path, device='cpu')
+            
+            state_dict_unet = unet.state_dict()
+            for k, v in ckpt_mvd.items():
+                if k in state_dict_unet:
+                    if state_dict_unet[k].shape == v.shape:
+                        state_dict_unet[k].copy_(v)
+                    else:
+                        print(f'[WARN] mismatching shape for UNet param {k}: ckpt {v.shape} != model {state_dict_unet[k].shape}')
+
+            # Tentativo di caricamento VAE dallo stesso safetensors (se presente)
+            state_dict_vae = vae.state_dict()
+            for k, v in ckpt_mvd.items():
+                vae_k = k.replace("vae.", "")
+                if vae_k in state_dict_vae:
+                    if state_dict_vae[vae_k].shape == v.shape:
+                        state_dict_vae[vae_k].copy_(v)
+
+        # 2. Caricamento pesi VAE da percorso o cartella dedicata
+        if vae_ckpt_path is not None:
+            if os.path.isdir(vae_ckpt_path):
+                safetensor_file = os.path.join(vae_ckpt_path, "diffusion_pytorch_model.safetensors")
+                if not os.path.exists(safetensor_file):
+                    safetensor_file = os.path.join(vae_ckpt_path, "model.safetensors")
+                
+                if os.path.exists(safetensor_file):
+                    vae_ckpt = load_file(safetensor_file, device='cpu')
+                    state_dict_vae = vae.state_dict()
+                    for k, v in vae_ckpt.items():
+                        if k in state_dict_vae and state_dict_vae[k].shape == v.shape:
+                            state_dict_vae[k].copy_(v)
+                    print(f"[INFO] Pesi VAE a 7 canali caricati da: {safetensor_file}")
+                else:
+                    try:
+                        vae = AutoencoderKL.from_pretrained(vae_ckpt_path)
+                        print(f"[INFO] VAE caricato da pretrained dir: {vae_ckpt_path}")
+                    except Exception as e:
+                        print(f"[WARN] Errore nel caricare VAE da dir {vae_ckpt_path}: {e}")
+            elif os.path.isfile(vae_ckpt_path):
+                vae_ckpt = load_file(vae_ckpt_path, device='cpu')
+                state_dict_vae = vae.state_dict()
+                for k, v in vae_ckpt.items():
+                    k_vae = k.replace("vae.", "")
+                    if k_vae in state_dict_vae and state_dict_vae[k_vae].shape == v.shape:
+                        state_dict_vae[k_vae].copy_(v)
+                print(f"[INFO] Pesi VAE a 7 canali caricati da file: {vae_ckpt_path}")
+
+        print("############# MVD models loaded #############")
+
+        pipe = ImageDreamPipeline(
+            vae=vae,
+            unet=unet,
+            image_encoder=image_encoder,
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            scheduler=noise_scheduler,
+        )
+
     pipe = pipe.to(device)
 
-    pipe.unet.eval()
-    pipe.unet.requires_grad_(False)
-    pipe.vae.eval()
-    pipe.vae.requires_grad_(False)
-    pipe.image_encoder.eval()
-    pipe.image_encoder.requires_grad_(False)
-    pipe.text_encoder.eval()
-    pipe.text_encoder.requires_grad_(False)
-
-    # PEDICO: adapter layer (7->3 canali) che fonde RGB+depth+normal, introdotto nel
-    # fine-tuning (vedi train_MultiviewDiffusion_diffusion.py). E' l'unico modulo
-    # che nel training aveva pesi diversi da quelli del backbone ImageDream originale,
-    # quindi va ricreato qui e i suoi pesi vanno caricati per coerenza con l'inferenza.
-    adapter_layer = nn.Sequential(
-        nn.Conv2d(7, hidden_dim, kernel_size=3, padding=1),
-        nn.ReLU(inplace=True),
-        
-        nn.Conv2d(hidden_dim, 3, kernel_size=3, padding=1),
-        
-        nn.Tanh() 
-    )
-
-
-    if adapter_ckpt_path is None:
-        # stessa convenzione di salvataggio usata in fase di training: il file
-        # "adapter_layer.pt" si trova nella stessa cartella del checkpoint della unet 2D
-        adapter_ckpt_path = os.path.join(os.path.dirname(unet2d_dict_path), "adapter_layer.pt")
-
-    if os.path.isfile(adapter_ckpt_path):
-        adapter_state_dict = torch.load(adapter_ckpt_path, map_location="cpu")
-        adapter_layer.load_state_dict(adapter_state_dict)
-        print(f"############# Adapter layer caricato da {adapter_ckpt_path} #############")
-    else:
-        # se non trovo nessun checkpoint mantengo inizializzazione casuale di default di nn.Conv2d.
-        print(f"[WARN] Nessun checkpoint per l'adapter layer trovato in {adapter_ckpt_path}: inizializzato a pesi casuali.")
-
-    adapter_layer = adapter_layer.to(device=device)
-    adapter_layer.eval()
-    adapter_layer.requires_grad_(False)
-
-
-    pipe.adapter_layer = adapter_layer
+    pipe.unet.eval().requires_grad_(False)
+    pipe.vae.eval().requires_grad_(False)
+    pipe.image_encoder.eval().requires_grad_(False)
+    pipe.text_encoder.eval().requires_grad_(False)
 
     return pipe
-
 
 
 def get_3ddiffusion_model(unet3d_dict_path, device, opt):
@@ -159,45 +155,39 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
 
     batch_size = 1
     num_view = 4
-    batch_orthogonal_size = batch_size * num_view
 
     batch["context_image"] = batch["context_image"].squeeze(dim=1)
 
     input_image = batch["context_image"].to(device=device, dtype=weight_dtype) 
     gt_pose = batch["imagedream_cam_poses_gt"].to(device=device, dtype=weight_dtype)
 
-    # PEDICO: fusione RGB + depth + normal (7 canali) -> 3 canali, stessa logica
-    # usata in fase di training (train_MultiviewDiffusion_diffusion.py), tramite
-    # l'adapter layer caricato in get_2ddiffusion_model
     context_depth = batch["context_depth"].squeeze(dim=1).to(device=device, dtype=weight_dtype)
     context_normal = batch["context_normal"].squeeze(dim=1).to(device=device, dtype=weight_dtype)
+    
     fused_input = torch.cat([input_image, context_depth, context_normal], dim=1)  # (B, 7, H, W)
-    fused_context_image = diffusion_2d_pipe.adapter_layer(fused_input)
-    fused_context_image = torch.clamp(fused_context_image, -1.0, 1.0).to(dtype=weight_dtype)
 
     cam_view_input = batch['cam_view_imagedream'].to(device=device, dtype=weight_dtype)
     cam_view_proj_input = batch['cam_view_proj_imagedream'].to(device=device, dtype=weight_dtype)
     cam_pos_input = batch['cam_pos_imagedream'].to(device=device, dtype=weight_dtype)
 
     gt_pose = gt_pose.view(-1, 4, 16) 
-    
-    h, w = input_image.shape[2:]
-
-    GUIDANCE_SCALE = 5.0
 
     diffusion_2d_pipe.scheduler.set_timesteps(50, device=device)
     timesteps = diffusion_2d_pipe.scheduler.timesteps
 
-    image_embeds_neg, image_embeds_pos = diffusion_2d_pipe.encode_image(fused_context_image, device, 1)
-    image_latents_neg, image_latents_pos = diffusion_2d_pipe.encode_image_latents(fused_context_image, device, 1)
+    # CLIP lavora esclusivamente sui primi 3 canali RGB
+    image_embeds_neg, image_embeds_pos = diffusion_2d_pipe.encode_image(fused_input[:, :3], device, 1)
+    
+    # VAE (a 7 canali) codifica l'intero tensore fused_input
+    image_latents_neg, image_latents_pos = diffusion_2d_pipe.encode_image_latents(fused_input, device, 1)
 
     _prompt_embeds = diffusion_2d_pipe._encode_prompt(
-            prompt=", 3d asset photorealistic human scan",
-            device=device,
-            num_images_per_prompt=1 * batch_size, 
-            do_classifier_free_guidance=True,
-            negative_prompt="uniform low no texture ugly, boring, bad anatomy, blurry, pixelated,  obscure, unnatural colors, poor lighting, dull, and unclear.",
-        ) 
+        prompt=", 3d asset photorealistic human scan",
+        device=device,
+        num_images_per_prompt=1 * batch_size, 
+        do_classifier_free_guidance=True,
+        negative_prompt="uniform low no texture ugly, boring, bad anatomy, blurry, pixelated, obscure, unnatural colors, poor lighting, dull, and unclear.",
+    ) 
     prompt_embeds_neg, prompt_embeds_pos = _prompt_embeds.chunk(2) 
 
     actual_num_frames = 5
@@ -215,14 +205,11 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
     camera_pose_ = gt_pose.view(batch_size, 4, 16)
     padding = [0] * (len(camera_pose_.shape) * 2)
     padding[-3] = 1
-    padding_tuple = tuple(padding)
-    camera = F.pad(camera_pose_, padding_tuple).to(dtype=latents.dtype, device=device)
+    camera = F.pad(camera_pose_, tuple(padding)).to(dtype=latents.dtype, device=device)
     camera = camera.repeat_interleave(1, dim=0)
     camera = einops.rearrange(camera, 'b nv c -> (b nv) c')
 
     for i, t in enumerate(timesteps):
-
-        ### 2d diffusion: get 3d inconsistent x0_tilde from 2d diffusion ###
 
         multiplier = 2 
         latent_model_input = torch.cat([latents] * multiplier)
@@ -255,8 +242,7 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
         beta_prod_t = 1 - alpha_prod_t 
         pred_original_latents = (noisy_latents - beta_prod_t ** (0.5) * pred_latent_epsilon) / alpha_prod_t ** (0.5) 
 
-        ### 3d diffusion: get 3d consistent x0_hat from 3d diffusion ###    
-         
+        ### 3d diffusion ###    
         vae_decoded_x0 = diffusion_2d_pipe.vae.decode(1 / diffusion_2d_pipe.vae.config.scaling_factor * pred_original_latents).sample 
         vae_decoded_xt = diffusion_2d_pipe.vae.decode(1 / diffusion_2d_pipe.vae.config.scaling_factor * noisy_latents).sample 
 
@@ -264,13 +250,12 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
         vae_decoded_xt = einops.rearrange(vae_decoded_xt, "(b n) c h w -> b n c h w", n=num_view)
         vae_decoded_x0xt = torch.cat([vae_decoded_x0, vae_decoded_xt], dim=2)
 
-
         context_image_duplicate = torch.cat([input_image.unsqueeze(dim=1), input_image.unsqueeze(dim=1)], dim=2)
         vae_decoded_x0xt_with_clear_context = torch.cat([vae_decoded_x0xt, context_image_duplicate], dim=1)
         vae_decoded_x0xt_with_clear_context = einops.rearrange(vae_decoded_x0xt_with_clear_context, "b n c h w -> (b n) c h w") 
         vae_decoded_x0xt_with_clear_context = (vae_decoded_x0xt_with_clear_context / 2 + 0.5).clamp(0, 1)
 
-        imagenet_mean =  (0.485, 0.456, 0.406, 0.485, 0.456, 0.406) 
+        imagenet_mean = (0.485, 0.456, 0.406, 0.485, 0.456, 0.406) 
         imagenet_std = (0.229, 0.224, 0.225, 0.229, 0.224, 0.225)
         diffusion3d_img_input_x0xt_with_context = TF.normalize(vae_decoded_x0xt_with_clear_context, imagenet_mean, imagenet_std) 
         diffusion3d_img_input_x0xt_with_context = einops.rearrange(diffusion3d_img_input_x0xt_with_context, "(b n) c h w -> b n c h w", n=num_view+1) 
@@ -292,13 +277,24 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
         mvr_rendering = diffusion_3d_pipe.gof.render(gaussians, cam_view_input, cam_view_proj_input, cam_pos_input, scale_modifier=1)
         rendered_input_image = mvr_rendering['image']
         rendered_input_image_ = einops.rearrange(rendered_input_image, 'b v c h w -> (b v) c h w')
-        vae_mean =  (0.5, 0.5, 0.5)
+        vae_mean = (0.5, 0.5, 0.5)
         vae_std = (0.5, 0.5, 0.5)
         rendered_input_image_ = TF.normalize(rendered_input_image_, vae_mean, vae_std) 
         rendered_input_image_ = F.interpolate(rendered_input_image_.clone(), size=(256, 256), mode='bilinear', align_corners=False) 
-        rendered_input_latent = diffusion_2d_pipe.vae.encode(rendered_input_image_).latent_dist.sample().detach() * diffusion_2d_pipe.vae.config.scaling_factor 
+        
+        # =========================================================================
+        # FIX: PADDING A 7 CANALI PER IL VAE (RGB 3ch + 4ch Zeros)
+        # =========================================================================
+        rendered_input_image_7ch = torch.cat([
+            rendered_input_image_,
+            torch.zeros(
+                rendered_input_image_.shape[0], 4, rendered_input_image_.shape[2], rendered_input_image_.shape[3],
+                device=rendered_input_image_.device, dtype=rendered_input_image_.dtype
+            )
+        ], dim=1)
 
-        ### get xt-1 from x0 hat and xt ###
+        rendered_input_latent = diffusion_2d_pipe.vae.encode(rendered_input_image_7ch).latent_dist.sample().detach() * diffusion_2d_pipe.vae.config.scaling_factor 
+
         pred_epsilon_from_x0hat = (noisy_latents - alpha_prod_t ** (0.5) * rendered_input_latent) / beta_prod_t ** (0.5) 
         pred_epsilon_from_x0hat = einops.rearrange(pred_epsilon_from_x0hat, '(b n) c h w -> b n c h w', n=num_view) 
         unet_pred_noise_contexview = unet_noise_pred_[:, -1:, :, :, :] 
@@ -343,13 +339,12 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
     
     vae_decoded_x0xt = torch.cat([vae_decoded_x0, vae_decoded_xt], dim=2)
 
-
     context_image_duplicate = torch.cat([input_image.unsqueeze(dim=1), input_image.unsqueeze(dim=1)], dim=2) 
     vae_decoded_x0xt_with_clear_context = torch.cat([vae_decoded_x0xt, context_image_duplicate], dim=1) 
     vae_decoded_x0xt_with_clear_context = einops.rearrange(vae_decoded_x0xt_with_clear_context, "b n c h w -> (b n) c h w") 
     vae_decoded_x0xt_with_clear_context = (vae_decoded_x0xt_with_clear_context / 2 + 0.5).clamp(0, 1) 
 
-    imagenet_mean =  (0.485, 0.456, 0.406, 0.485, 0.456, 0.406)
+    imagenet_mean = (0.485, 0.456, 0.406, 0.485, 0.456, 0.406)
     imagenet_std = (0.229, 0.224, 0.225, 0.229, 0.224, 0.225)
     diffusion3d_img_input_x0xt_with_context = TF.normalize(vae_decoded_x0xt_with_clear_context, imagenet_mean, imagenet_std) 
     diffusion3d_img_input_x0xt_with_context = einops.rearrange(diffusion3d_img_input_x0xt_with_context, "(b n) c h w -> b n c h w", n=num_view+1)
@@ -373,22 +368,17 @@ def joint_2d_3d_diffusion(batch, device, diffusion_2d_pipe, diffusion_3d_pipe, w
 
 def save_generation_results(subject_save_folder, batch, device, gaussians, diffusion_3d_pipe, weight_dtype):
 
-
     input_image = batch["context_image"].to(device=device, dtype=weight_dtype) 
-    # save generated 3dgs model
     diffusion_3d_pipe.gof.save_ply(gaussians, os.path.join(subject_save_folder, 'gs.ply'))
 
-    # save input image for visualization
     input_image_save = ((np.concatenate(input_image.permute(0, 2, 3, 1).cpu().numpy(), 1) + 1) / 2 * 255).astype(np.uint8)
     imsave(os.path.join(subject_save_folder, 'input.png'), input_image_save)
 
-    # save 32 views of the 3d model
     cam_view = batch['cam_view'].to(device=device, dtype=weight_dtype)
     cam_view_proj = batch['cam_view_proj'].to(device=device, dtype=weight_dtype)
     cam_pos = batch['cam_pos'].to(device=device, dtype=weight_dtype)
     rendered_output = diffusion_3d_pipe.gof.render(gaussians, cam_view, cam_view_proj, cam_pos, scale_modifier=1)
     rendered_output_image = rendered_output['image']
-    rendered_output_mask = rendered_output['mask'] 
     rendered_output_image = einops.rearrange(rendered_output_image, 'b v c h w -> (b v) c h w')
 
     grid_rendered = make_grid(rendered_output_image, nrow=8) 
