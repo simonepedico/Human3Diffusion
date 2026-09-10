@@ -24,7 +24,6 @@ def main():
     # Path del modello 2D (UNet)
     dict2ddiffusion_path = os.path.join(args.checkpoints, 'model.safetensors')
     if not os.path.exists(dict2ddiffusion_path):
-        # Se la cartella checkpoints contiene la pipeline esportata per intero
         if os.path.exists(os.path.join(args.checkpoints, 'unet')):
             dict2ddiffusion_path = args.checkpoints
 
@@ -51,16 +50,22 @@ def main():
     dict3ddiffusion_path = os.path.join(args.checkpoints, 'model_1.safetensors')
     diffusion3dgs_model = get_3ddiffusion_model(dict3ddiffusion_path, device, opt)
 
-    # Prepare dataset and dataloader
-    all_files = [os.path.join(args.test_imgs, f) for f in os.listdir(args.test_imgs) if f.endswith('.png')]
+    # Scansione ricorsiva di tutte le sottocartelle in test_imgs
+    rgb_files = []
+    for root, dirs, files in os.walk(args.test_imgs):
+        for file in sorted(files):
+            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                f_lower = file.lower()
+                # Esclude mappe depth e normal per isolare il render RGB principale
+                if not ("_depth" in f_lower or "_normal" in f_lower or "depth_processed" in f_lower or "normal_processed" in f_lower):
+                    rgb_files.append(os.path.join(root, file))
     
-    rgb_files = [f for f in all_files if not ("_depth" in f or "_normal" in f)]
     rgb_files = sorted(rgb_files)
-    
+
     if not rgb_files:
-        raise FileNotFoundError(f"Non ho trovato nessuna immagine RGB principale in: {args.test_imgs}")
+        raise FileNotFoundError(f"Non ho trovato nessuna immagine RGB principale in nessuna sottocartella di: {args.test_imgs}")
         
-    print(f"[INFO] File RGB rilevati per l'inferenza: {rgb_files}")
+    print(f"[INFO] Trovati {len(rgb_files)} file RGB per l'inferenza distribuiti nelle sottocartelle.")
 
     # Inizializzazione dataset
     dataset = joint_diffusion_inference_dataset(opt, rgb_path_list=rgb_files, white_bg=True)
@@ -72,7 +77,16 @@ def main():
     for i, batch in enumerate(dataloader):
         current_rgb_path = rgb_files[i]
         
-        subject_id = os.path.splitext(os.path.basename(current_rgb_path))[0]
+        # Mantiene la struttura di sottocartelle anche nella destinazione di output
+        rel_path = os.path.relpath(current_rgb_path, args.test_imgs)
+        rel_dir = os.path.dirname(rel_path)
+        base_filename = os.path.splitext(os.path.basename(current_rgb_path))[0]
+
+        if rel_dir and rel_dir != ".":
+            subject_id = os.path.join(rel_dir, base_filename)
+        else:
+            subject_id = base_filename
+
         subject_save_folder = os.path.join(args.output, subject_id)
         
         if os.path.exists(os.path.join(subject_save_folder, 'gs.ply')):
@@ -84,10 +98,24 @@ def main():
 
         rgb_path = current_rgb_path
         base, ext = os.path.splitext(rgb_path)
-        depth_path = f"{base}_depth{ext}"
-        normal_path = f"{base}_normal{ext}"
+        folder = os.path.dirname(rgb_path)
 
-        if os.path.exists(depth_path) and os.path.exists(normal_path):
+        # Ricerca flessibile delle mappe depth e normal (supporta sia nome_depth che depth_processed)
+        cand_depths = [
+            f"{base}_depth{ext}",
+            os.path.join(folder, f"depth_processed{ext}"),
+            os.path.join(folder, "depth_processed.png")
+        ]
+        cand_normals = [
+            f"{base}_normal{ext}",
+            os.path.join(folder, f"normal_processed{ext}"),
+            os.path.join(folder, "normal_processed.png")
+        ]
+
+        depth_path = next((p for p in cand_depths if os.path.exists(p)), None)
+        normal_path = next((p for p in cand_normals if os.path.exists(p)), None)
+
+        if depth_path and normal_path:
             from PIL import Image
             import torchvision.transforms.functional as TF
             
@@ -105,7 +133,7 @@ def main():
             
             print(f"[INFO] Mappe Depth e Normal caricate per: {subject_id}")
         else:
-            raise FileNotFoundError(f"Impossibile trovare le mappe richieste per {rgb_path}: {depth_path} o {normal_path}")
+            raise FileNotFoundError(f"Impossibile trovare le mappe richieste per {rgb_path} dentro '{folder}'")
 
         gaussians = joint_2d_3d_diffusion(batch, device, pipe, diffusion3dgs_model, weight_dtype=WEIGHT_DTYPE)
 
