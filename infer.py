@@ -12,6 +12,7 @@ def main():
     parser.add_argument('--test_imgs', type=str, default='test_imgs', help='Directory containing test images.')
     # percorso adapter layer 
     parser.add_argument('--adapter_ckpt', type=str, default=None, help='Path to the trained adapter layer checkpoint.')
+    parser.add_argument('--pipeline_path', required=True, help='Complete corrected pipeline-best export.')
     args = parser.parse_args()
 
     # Set device
@@ -26,18 +27,7 @@ def main():
     # Load 2D diffusion model
     dict2ddiffusion_path = os.path.join(args.checkpoints, 'model.safetensors')
     
-    # PEDICO: inizializzo a pesi random se l'adapter non viene caricato
-    adapter_path = args.adapter_ckpt
-    if adapter_path is None:
-        potential_adapter = os.path.join(args.checkpoints, 'adapter_layer.pt')
-        if os.path.exists(potential_adapter):
-            adapter_path = potential_adapter
-            print(f"[INFO] Trovato adapter layer automatico in: {adapter_path}")
-        else:
-            print("[ATTENZIONE] Nessun adapter_layer.pt trovato nella cartella dei checkpoint. Verrà usato l'adapter di default non addestrato!")
-
-
-    pipe = get_2ddiffusion_model(dict2ddiffusion_path, device, adapter_ckpt_path=adapter_path)
+    pipe = get_2ddiffusion_model(args.pipeline_path, device, adapter_ckpt_path=args.adapter_ckpt)
 
     # PEDICO
     pipe = pipe.to(torch.float32)
@@ -62,7 +52,7 @@ def main():
     print(f"[INFO] File RGB rilevato per l'inferenza: {rgb_files}")
 
     # inizializzazione dataset
-    dataset = joint_diffusion_inference_dataset(opt, rgb_path_list=rgb_files, white_bg=True)
+    dataset = joint_diffusion_inference_dataset(opt, rgb_path_list=rgb_files, white_bg=True, require_maps=True)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4)
 
     # Create output directory
@@ -82,39 +72,6 @@ def main():
 
         WEIGHT_DTYPE = torch.float32
         os.makedirs(subject_save_folder, exist_ok=True)
-
-        # cerco normal e depth
-        rgb_path = current_rgb_path
-        base, ext = os.path.splitext(rgb_path)
-        depth_path = f"{base}_depth{ext}"
-        normal_path = f"{base}_normal{ext}"
-
-        if os.path.exists(depth_path) and os.path.exists(normal_path):
-            from PIL import Image
-            import torchvision.transforms.functional as TF
-            
-            # carico immagini
-            # se avessi la depth in piu cnaali, la converto in monocanale
-            depth_img = Image.open(depth_path).convert("L")
-            normal_img = Image.open(normal_path).convert("RGB")
-            
-            # ridimiensioni immagini 256x256
-            depth_img = depth_img.resize((256, 256), Image.BILINEAR)
-            normal_img = normal_img.resize((256, 256), Image.BILINEAR)
-            
-            # trasformo in tensor e  normalizzo nel range [-1.0, 1.0]
-            depth_tensor = TF.to_tensor(depth_img) * 2.0 - 1.0
-            normal_tensor = TF.to_tensor(normal_img) * 2.0 - 1.0
-            
-            # aggiungo dimensioni per simulare output dataloader
-            # Risultato finale desiderato dopo lo squeeze: (B, C, H, W) -> es. (1, 3, 256, 256)
-            batch['context_depth'] = depth_tensor.unsqueeze(0).unsqueeze(1)   # Diventa (1, 1, 1, H, W)
-            batch['context_normal'] = normal_tensor.unsqueeze(0).unsqueeze(1) # Diventa (1, 1, 3, H, W)
-            
-            print("[INFO] Mappe Depth e Normal caricate e formattate correttamente.")
-        else:
-            raise FileNotFoundError(f"Impossibile trovare le mappe richieste: {depth_path} o {normal_path}")
-       
 
         gaussians = joint_2d_3d_diffusion(batch, device, pipe, diffusion3dgs_model, weight_dtype=WEIGHT_DTYPE)
 
