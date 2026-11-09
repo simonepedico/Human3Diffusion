@@ -23,7 +23,7 @@ def main():
     all_files = os.listdir(args.test_imgs)
     context_image_path = [
         os.path.join(args.test_imgs, i) for i in all_files 
-        if not (i.endswith("_depth.png") or i.endswith("_normal.png") or i.endswith("_depth.jpg") or i.endswith("_normal.jpg"))
+        if i.lower().endswith(".png") and not i.lower().endswith(("_depth.png", "_normal.png"))
     ]
     
     test_dataset = joint_diffusion_inference_dataset(opt, context_image_path, white_bg=True)
