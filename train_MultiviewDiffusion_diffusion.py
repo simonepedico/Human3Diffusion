@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 import os
 import copy
@@ -16,7 +17,7 @@ import time
 from huggingface_hub.constants import HF_HUB_CACHE
 from sklearn.model_selection import GroupShuffleSplit
 
-HF_TOKEN = os.environ.get("HF_TOKEN", "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")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 os.environ["WANDB__SERVICE_WAIT"] = "300"
 os.environ["NCCL_P2P_DISABLE"] = "1"
@@ -38,6 +39,7 @@ from diffusers.optimization import get_cosine_schedule_with_warmup
 from transformers import CLIPTextModel, CLIPVisionModel, CLIPTokenizer
 from mvdream.mv_unet import MultiViewUNetModel
 from core.dataset_human_imagedream import Imagedream_LGM_dataset
+from core.conditioning_utils import (clip_preprocess, diffusion_target, predict_clean, foreground_loss, ConditioningEncoder)
 from mvdream.pipeline_imagedream import ImageDreamPipeline
 
 logger = get_logger(__name__)
@@ -61,14 +63,7 @@ def get_path_size_str(path: Union[str, Path]) -> str:
         total_bytes /= 1024.0
     return f"{total_bytes:.2f} PB"
 
-def CLIP_preprocess(x):
-    if x.min() < 0:
-        x = (x + 1.0) / 2.0
-    x = F.interpolate(x, size=(224, 224), mode='bicubic', align_corners=False)
-    mean = torch.tensor([0.48145466, 0.4578275, 0.40821073], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    std = torch.tensor([0.26862954, 0.26130258, 0.27577711], device=x.device, dtype=x.dtype).view(1, 3, 1, 1)
-    x = (x - mean) / std
-    return x
+CLIP_preprocess = clip_preprocess
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Argparser for ImageDream fine-tuning script.")
@@ -99,6 +94,10 @@ def parse_args(input_args=None):
     parser.add_argument("--num_train_epochs", type=int, default=30) # MODIFICATO: da 100 a 30
     parser.add_argument("--mixed_precision", type=str, default="bf16")
 
+    parser.add_argument('--subject_ids_json', type=str, default=None, help='JSON: mesh folder name -> real subject ID; all poses and outfits of one person share an ID.')
+    parser.add_argument('--foreground_loss_weight', type=float, default=1.0)
+    parser.add_argument('--rgb_loss_weight', type=float, default=0.1)
+    parser.add_argument('--rgb_loss_max_t', type=int, default=500)
     return parser.parse_args(input_args) if input_args is not None else parser.parse_args()
 
 def _encode_text_prompt(tokenizer, text_encoder, prompt, device, batch_size):
@@ -155,7 +154,7 @@ def compute_val_loss(
             gt_latents = vae_gt.encode(gt_image.to(dtype=weight_dtype)).latent_dist.mode() * vae_gt.config.scaling_factor
             gt_latents = gt_latents.to(dtype=torch.float32)
 
-            image_latents = vae.encode(fused_input.float()).latent_dist.mode() * vae.config.scaling_factor
+            image_latents = vae(fused_input)
 
             image_clip = CLIP_preprocess(fused_input[:, :3]).to(dtype=weight_dtype)
             image_clip_embedding = image_encoder(image_clip, output_hidden_states=True).hidden_states[-2]
@@ -191,16 +190,16 @@ def compute_val_loss(
                 unet_inputs = {
                     'x': noisy_latents_with_ip_latent,
                     'timesteps': timestep_with_ip,
-                    'context': torch.cat([text_prompt_embeds] * actual_num_frames),
+                    'context': text_prompt_embeds.repeat_interleave(actual_num_frames, dim=0),
                     'num_frames': actual_num_frames,
                     'camera': camera,
-                    'ip': torch.cat([image_clip_embedding] * actual_num_frames),
+                    'ip': image_clip_embedding.repeat_interleave(actual_num_frames, dim=0),
                     'ip_img': image_latents,
                 }
 
-                unet_noise_pred = unet.forward(**unet_inputs)
+                unet_noise_pred = unet(**unet_inputs)
 
-                target = noise if noise_scheduler.config.prediction_type == "epsilon" else noise_scheduler.get_velocity(gt_latents, noise, timesteps)
+                target = diffusion_target(noise_scheduler, gt_latents, noise, timesteps)
 
                 unet_noise_pred = einops.rearrange(unet_noise_pred, "(b nv) c h w -> b nv c h w", nv=actual_num_frames)
                 unet_orthogonal_noise_pred = einops.rearrange(unet_noise_pred[:, :-1, :, :, :], "b nv c h w -> (b nv) c h w")
@@ -208,10 +207,13 @@ def compute_val_loss(
                 loss_t = F.mse_loss(unet_orthogonal_noise_pred.float(), target.float(), reduction="mean")
                 batch_step_loss += loss_t.item()
 
-            val_loss_total += (batch_step_loss / len(eval_timesteps))
-            val_steps += 1
+            val_loss_total += (batch_step_loss / len(eval_timesteps)) * batch_size
+            val_steps += batch_size
 
-    return val_loss_total / max(val_steps, 1)
+    stats = accelerator.reduce(torch.tensor([val_loss_total, val_steps], device=accelerator.device, dtype=torch.float64), reduction='sum')
+    if stats[1] == 0:
+        raise ValueError('Empty validation set')
+    return (stats[0] / stats[1]).item()
 
 def main(args):
     args.max_train_steps = None
@@ -283,9 +285,15 @@ def main(args):
     
     # 3. Inietta i pesi completi nel modello
     state_dict = unet.state_dict()
+    loaded_keys = set()
     for k, v in ckpt_mvd_2k2k.items():
         if k in state_dict and state_dict[k].shape == v.shape:
             state_dict[k].copy_(v)
+            loaded_keys.add(k)
+
+    missing = set(state_dict) - loaded_keys
+    if missing:
+        raise ValueError(f'Incomplete Human3Diffusion UNet checkpoint: {len(missing)} missing/mismatched keys: {sorted(missing)[:5]}')
 
     # =========================================================================
     # VAE_GT: COPIA A 3 CANALI PER TARGET GROUND TRUTH (100% CONGELATO)
@@ -309,11 +317,12 @@ def main(args):
 
     with torch.no_grad():
         new_conv.weight[:, :3, :, :].copy_(old_conv.weight)
-        nn.init.normal_(new_conv.weight[:, 3:, :, :], mean=0.0, std=0.02)
+        nn.init.zeros_(new_conv.weight[:, 3:, :, :])  # Initially preserve pretrained RGB behavior.
         if old_conv.bias is not None:
             new_conv.bias.copy_(old_conv.bias)
 
     vae.encoder.conv_in = new_conv
+    vae.register_to_config(in_channels=7)
 
     # =========================================================================
     # CONGELAMENTO / SCONGELAMENTO PARAMETRI E LEARNING RATES
@@ -362,6 +371,7 @@ def main(args):
 
     if args.use_ema:
         ema_unet = EMAModel(unet_trainable_params, decay=0.9999)
+        ema_vae = EMAModel(vae_trainable_params, decay=0.9999)
 
     print_model_info(unet)
     print_model_info(vae)
@@ -415,6 +425,21 @@ def main(args):
     end_time = time.time()
     logger.info(f"-> Scansione completata in {end_time - start_time:.2f} secondi. Trovate {len(quadruple_locali)} viste in totale.")
 
+    subject_map = None
+    if args.subject_ids_json:
+        with open(args.subject_ids_json) as stream:
+            subject_map = json.load(stream)
+        for q in quadruple_locali:
+            name = os.path.basename(q['cartella_origine'])
+            if not isinstance(subject_map.get(name), str) or not subject_map[name].strip():
+                raise ValueError(f'Missing subject ID for {name}')
+    else:
+        logger.warning('Filename-derived split is not verified identity-disjoint. Supply --subject_ids_json for generalization evaluation.')
+
+    def subject_id(q, sizer=False):
+        name = os.path.basename(q['cartella_origine'])
+        return subject_map[name] if subject_map is not None else (name if sizer else name.split('_')[0])
+
     # --- LOGICA DI SPLITTING ---
     quadruple_normali = []
     quadruple_sizer = []
@@ -433,14 +458,14 @@ def main(args):
 
     # 1. Splitting Mesh Normali (Invariato: ~80% Train, ~10% Val, ~10% Test)
     if len(quadruple_normali) > 0:
-        subject_ids_normali = [os.path.basename(q["cartella_origine"]).split('_')[0] for q in quadruple_normali]
+        subject_ids_normali = [subject_id(q) for q in quadruple_normali]
         gss1 = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
         train_idx_norm, resto_idx_norm = next(gss1.split(quadruple_normali, groups=subject_ids_normali))
         
         train_paths.extend([quadruple_normali[i] for i in train_idx_norm])
         resto_paths_norm = [quadruple_normali[i] for i in resto_idx_norm]
         
-        resto_subject_ids = [os.path.basename(q["cartella_origine"]).split('_')[0] for q in resto_paths_norm]
+        resto_subject_ids = [subject_id(q) for q in resto_paths_norm]
         gss2 = GroupShuffleSplit(n_splits=1, test_size=0.50, random_state=42)
         val_idx_norm, test_idx_norm = next(gss2.split(resto_paths_norm, groups=resto_subject_ids))
         
@@ -449,7 +474,7 @@ def main(args):
 
     # 2. Splitting Mesh Sizer (Train 80%, Validation 20%, niente Test)
     if len(quadruple_sizer) > 0:
-        subject_ids_sizer = [os.path.basename(q["cartella_origine"]) for q in quadruple_sizer]
+        subject_ids_sizer = [subject_id(q, sizer=True) for q in quadruple_sizer]
         gss_sizer = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
         train_idx_sizer, val_idx_sizer = next(gss_sizer.split(quadruple_sizer, groups=subject_ids_sizer))
         
@@ -457,6 +482,17 @@ def main(args):
         val_paths.extend([quadruple_sizer[i] for i in val_idx_sizer])
 
     logger.info(f"-> Distribuzione dataset:\n   - Train: {len(train_paths)} | - Val: {len(val_paths)} | - Test: {len(test_paths)}")
+
+    if subject_map is not None:
+        groups = [{subject_id(q) for q in split} for split in (train_paths, val_paths, test_paths)]
+        if any(groups[i] & groups[j] for i in range(3) for j in range(i+1, 3)):
+            raise ValueError('Subject leakage between splits, including across source datasets.')
+    if not train_paths or not val_paths:
+        raise ValueError('Training and validation must both be nonempty')
+    if accelerator.is_main_process:
+        with open(os.path.join(args.output_dir, 'split_manifest.json'), 'w') as stream:
+            json.dump({label: sorted({q['cartella_origine'] for q in split}) for label, split in
+                       [('train', train_paths), ('val', val_paths), ('test', test_paths)]}, stream, indent=2)
 
     train_dataset = Imagedream_LGM_dataset(lista_quadruple=train_paths, opt=opt, training=True, white_bg=True)
     train_dataloader = torch.utils.data.DataLoader(train_dataset, shuffle=True, batch_size=args.train_batch_size, num_workers=1)
@@ -481,6 +517,7 @@ def main(args):
         num_training_steps=total_steps,
     )
 
+    vae = ConditioningEncoder(vae)
     unet, vae, optimizer, train_dataloader, val_dataloader, scheduler = accelerator.prepare(
         unet, vae, optimizer, train_dataloader, val_dataloader, scheduler
     )
@@ -500,13 +537,26 @@ def main(args):
     
     if args.use_ema:
         ema_unet.to(accelerator.device)
+        ema_vae.to(accelerator.device)
+        accelerator.register_for_checkpointing(ema_unet, ema_vae)
 
     if accelerator.is_main_process:
         tracker_config = dict(vars(args))
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
+    best_val_loss = float("inf")
     global_step = 0
     first_epoch = 0
+    if args.resume_from_checkpoint:
+        state_path = os.path.join(args.resume_from_checkpoint, 'training_progress.json')
+        if not os.path.isfile(state_path):
+            raise ValueError('Only corrected checkpoints with training_progress.json can be resumed.')
+        with open(state_path) as stream:
+            progress = json.load(stream)
+        accelerator.load_state(args.resume_from_checkpoint)
+        first_epoch = int(progress['next_epoch'])
+        global_step = int(progress['global_step'])
+        best_val_loss = float(progress['best_val_loss'])
 
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -520,7 +570,7 @@ def main(args):
         num_train_elems = 0
         unet.train()
         for step, batch in enumerate(train_dataloader):
-            with accelerator.accumulate(unet):
+            with accelerator.accumulate(unet, vae):
                 batch_size = batch['imagedream_images_gt'].shape[0]
                 num_view = batch['imagedream_images_gt'].shape[1]
                 actual_num_frames = num_view + 1
@@ -548,29 +598,18 @@ def main(args):
                 noisy_latents = noise_scheduler.add_noise(gt_latents, noise, timesteps).to(dtype=gt_latents.dtype)
 
                 p_drop = args.conditioning_dropout_prob
-                r = torch.rand(batch_size, device=gt_latents.device)
-
-                drop_rgb = (r < p_drop).reshape(batch_size, 1, 1, 1)
-                drop_maps = ((r >= p_drop) & (r < 2 * p_drop)).reshape(batch_size, 1, 1, 1)
-                drop_all = ((r >= 2 * p_drop) & (r < 3 * p_drop)).reshape(batch_size, 1, 1, 1)
-
-                blank_rgb = torch.ones(batch_size, 3, args.resolution, args.resolution, device=gt_latents.device)
-                blank_maps = torch.zeros(batch_size, 4, args.resolution, args.resolution, device=gt_latents.device)
-
-                curr_rgb = fused_input[:, :3]
-                curr_maps = fused_input[:, 3:]
-
-                curr_rgb = torch.where(drop_rgb | drop_all, blank_rgb, curr_rgb)
-                curr_maps = torch.where(drop_maps | drop_all, blank_maps, curr_maps)
-
-                new_input_after_dropout = torch.cat([curr_rgb, curr_maps], dim=1)
-
-                image_clip = CLIP_preprocess(new_input_after_dropout[:, :3]).to(dtype=weight_dtype)
-                image_clip_embedding = image_encoder(image_clip, output_hidden_states=True).hidden_states[-2]
-
-                image_latents = vae.encode(new_input_after_dropout.float()).latent_dist.sample() * vae.config.scaling_factor
-
-                text_prompt_embeds = _encode_text_prompt(tokenizer, text_encoder, text_prompt, gt_latents.device, batch_size)
+                if not 0 <= p_drop <= 1:
+                    raise ValueError('conditioning_dropout_prob must be in [0, 1]')
+                drop_all = (torch.rand(batch_size, device=gt_latents.device) < p_drop)
+                image_clip = CLIP_preprocess(input_image).to(dtype=weight_dtype)
+                with torch.no_grad():
+                    image_clip_embedding = image_encoder(image_clip, output_hidden_states=True).hidden_states[-2]
+                    text_prompt_embeds = _encode_text_prompt(tokenizer, text_encoder, text_prompt, gt_latents.device, batch_size)
+                    null_text = _encode_text_prompt(tokenizer, text_encoder, '', gt_latents.device, batch_size)
+                image_latents = vae(fused_input)
+                image_latents = torch.where(drop_all[:, None, None, None], torch.zeros_like(image_latents), image_latents)
+                image_clip_embedding = torch.where(drop_all[:, None, None], torch.zeros_like(image_clip_embedding), image_clip_embedding)
+                text_prompt_embeds = torch.where(drop_all[:, None, None], null_text, text_prompt_embeds)
 
                 noisy_gt_latents = einops.rearrange(noisy_latents, "(b n) c h w -> b n c h w", n=num_view)
                 clear_image_latents = einops.rearrange(image_latents, "b c h w -> b 1 c h w")
@@ -592,26 +631,45 @@ def main(args):
                 unet_inputs = {
                     'x': noisy_latents_with_ip_latent,
                     'timesteps': timestep_with_ip,
-                    'context': torch.cat([text_prompt_embeds] * actual_num_frames),
+                    'context': text_prompt_embeds.repeat_interleave(actual_num_frames, dim=0),
                     'num_frames': actual_num_frames,
                     'camera': camera,
-                    'ip': torch.cat([image_clip_embedding] * actual_num_frames),
+                    'ip': image_clip_embedding.repeat_interleave(actual_num_frames, dim=0),
                     'ip_img': image_latents,
                 }
 
-                unet_noise_pred = unet.forward(**unet_inputs)
+                unet_noise_pred = unet(**unet_inputs)
 
-                target = noise if noise_scheduler.config.prediction_type == "epsilon" else noise_scheduler.get_velocity(gt_latents, noise, timesteps)
+                target = diffusion_target(noise_scheduler, gt_latents, noise, timesteps)
                 
                 unet_noise_pred = einops.rearrange(unet_noise_pred, "(b nv) c h w -> b nv c h w", nv=actual_num_frames)
                 unet_orthogonal_noise_pred = einops.rearrange(unet_noise_pred[:, :-1, :, :, :], "b nv c h w -> (b nv) c h w")
                 
                 loss = F.mse_loss(unet_orthogonal_noise_pred.float(), target.float(), reduction="mean")
 
+                loss_diffusion = loss
+                target_masks = einops.rearrange(batch['imagedream_masks_gt'], 'b n c h w -> (b n) c h w')
+                loss_foreground = foreground_loss(unet_orthogonal_noise_pred, target, target_masks)
+                loss_rgb = loss_diffusion * 0
+                # Supervise decoded x0 only at moderate/low noise and with real conditioning.
+                supervised = (timesteps <= args.rgb_loss_max_t) & ~drop_all.repeat_interleave(num_view)
+                if args.rgb_loss_weight > 0 and supervised.any():
+                    predicted_clean = predict_clean(noise_scheduler, noisy_latents, unet_orthogonal_noise_pred, timesteps)
+                    decoded = vae_gt.decode((predicted_clean[supervised] / vae_gt.config.scaling_factor).to(weight_dtype)).sample
+                    # Frozen decoder parameters still propagate gradients to the denoiser/VAE input.
+                    loss_rgb = foreground_loss(decoded, gt_image[supervised], target_masks[supervised])
+                loss = loss_diffusion + args.foreground_loss_weight * loss_foreground + args.rgb_loss_weight * loss_rgb
+                if not torch.isfinite(loss):
+                    raise FloatingPointError('Non-finite training loss')
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     vae_unwrapped = accelerator.unwrap_model(vae)
-                    params_to_clip = list(vae_unwrapped.encoder.conv_in.parameters()) + [p for p in unet.parameters() if p.requires_grad]
+                    params_to_clip = list(vae_unwrapped.vae.encoder.conv_in.parameters()) + [p for p in unet.parameters() if p.requires_grad]
+                    conv_grad = vae_unwrapped.vae.encoder.conv_in.weight.grad
+                    if conv_grad is None:
+                        raise RuntimeError('Conditioning VAE is disconnected from the loss')
+                    accelerator.log({'grad_vae_rgb': conv_grad[:, :3].float().norm().item(),
+                                     'grad_vae_maps': conv_grad[:, 3:].float().norm().item()}, step=global_step)
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
@@ -622,6 +680,7 @@ def main(args):
                 
                 if args.use_ema:
                     ema_unet.step([p for p in unet.parameters() if p.requires_grad])
+                    ema_vae.step(vae_trainable_params)
                     
                 progress_bar.update(1)
                 global_step += 1
@@ -632,7 +691,7 @@ def main(args):
             loss_epoch += loss.detach().item()
             num_train_elems += 1
 
-            logs = {"loss": loss.detach().item(), "lr": optimizer.param_groups[0]['lr'],
+            logs = {"loss_diffusion": loss_diffusion.detach().item(), "loss_foreground": loss_foreground.detach().item(), "loss_rgb": loss_rgb.detach().item(), "loss": loss.detach().item(), "lr": optimizer.param_groups[0]['lr'],
                     "loss_epoch": loss_epoch / num_train_elems, "epoch": epoch}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
@@ -646,15 +705,30 @@ def main(args):
         if args.use_ema:
             trainable_params_val = [p for p in unet.parameters() if p.requires_grad]
             ema_unet.store(trainable_params_val)
+            ema_vae.store(vae_trainable_params)
             ema_unet.copy_to(trainable_params_val)
+            ema_vae.copy_to(vae_trainable_params)
 
         val_loss = compute_val_loss(
             unet, vae, vae_gt, image_encoder, text_encoder, tokenizer,
             noise_scheduler, val_dataloader, accelerator, weight_dtype, args
         )
         
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            if accelerator.is_main_process:
+                best_pipe = ImageDreamPipeline(
+                    vae=accelerator.unwrap_model(vae).vae, unet=accelerator.unwrap_model(unet),
+                    image_encoder=image_encoder, tokenizer=tokenizer, text_encoder=text_encoder,
+                    scheduler=noise_scheduler)
+                best_path = os.path.join(args.output_dir, 'pipeline-best')
+                best_pipe.save_pretrained(best_path)
+                vae_gt.save_pretrained(os.path.join(best_path, 'vae_rgb'))
+                del best_pipe
+
         if args.use_ema:
             ema_unet.restore([p for p in unet.parameters() if p.requires_grad])
+            ema_vae.restore(vae_trainable_params)
 
         train_loss_epoch_avg = loss_epoch / max(num_train_elems, 1)
         logger.info(f"--- [EPOCH {epoch}] Train Loss Epoch: {train_loss_epoch_avg:.6f} | Val Loss: {val_loss:.6f} ---")
@@ -663,6 +737,13 @@ def main(args):
         # =========================================================================
         # SALVATAGGIO PIPELINE E CHECKPOINT OGNI 5 EPOCHE
         # =========================================================================
+        if (epoch + 1) % 5 == 0:
+            accelerator.wait_for_everyone()
+            save_path = os.path.join(args.output_dir, f'checkpoint-{epoch+1}')
+            accelerator.save_state(save_path)
+            if accelerator.is_main_process:
+                with open(os.path.join(save_path, 'training_progress.json'), 'w') as stream:
+                    json.dump({'next_epoch': epoch+1, 'global_step': global_step, 'best_val_loss': best_val_loss}, stream)
         if accelerator.is_main_process:
             if (epoch + 1) % 5 == 0:
                 # --- 1. ROTAZIONE DEI FILE VECCHI ---
@@ -672,8 +753,8 @@ def main(args):
                     checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
                     checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                    if len(checkpoints) >= args.checkpoints_total_limit:
-                        num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                    if len(checkpoints) > args.checkpoints_total_limit:
+                        num_to_remove = len(checkpoints) - args.checkpoints_total_limit
                         removing_checkpoints = checkpoints[0:num_to_remove]
                         for removing_checkpoint in removing_checkpoints:
                             removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
@@ -694,7 +775,6 @@ def main(args):
 
                 # --- 2. SALVATAGGIO STATO ACCELERATE (PER RIPRENDERE IL TRAINING) ---
                 save_path = os.path.join(args.output_dir, f"checkpoint-{epoch+1}")
-                accelerator.save_state(save_path)
                 print(f"-> Checkpoint salvato in: {save_path} | Dimensione: {get_path_size_str(save_path)}")
 
                 # --- 3. SALVATAGGIO PIPELINE COME A FINE TRAINING (PER TEST INFERENZA) ---
@@ -703,10 +783,12 @@ def main(args):
                 if args.use_ema:
                     trainable_params_save = [p for p in unet_unwrapped_ckpt.parameters() if p.requires_grad]
                     ema_unet.store(trainable_params_save)
+                    ema_vae.store(vae_trainable_params)
                     ema_unet.copy_to(trainable_params_save)
+                    ema_vae.copy_to(vae_trainable_params)
                     
                 pipeline_ckpt = ImageDreamPipeline(
-                    vae=accelerator.unwrap_model(vae),
+                    vae=accelerator.unwrap_model(vae).vae,
                     unet=unet_unwrapped_ckpt,
                     image_encoder=accelerator.unwrap_model(image_encoder),
                     tokenizer=tokenizer,
@@ -715,11 +797,13 @@ def main(args):
                 )
                 pipeline_save_path = os.path.join(args.output_dir, f"pipeline-{epoch+1}")
                 pipeline_ckpt.save_pretrained(pipeline_save_path)
+                vae_gt.save_pretrained(os.path.join(pipeline_save_path, 'vae_rgb'))
                 print(f"-> Pipeline salvata in: {pipeline_save_path} | Dimensione: {get_path_size_str(pipeline_save_path)}")
 
                 # RIPRISTINO PESI ORIGINALI DOPO IL SALVATAGGIO INTERMEDIO
                 if args.use_ema:
                     ema_unet.restore([p for p in unet_unwrapped_ckpt.parameters() if p.requires_grad])
+                    ema_vae.restore(vae_trainable_params)
 
     # =========================================================================
     # SALVATAGGIO PIPELINE E UPLOAD PIPELINE A FINE TRAINING
@@ -732,10 +816,12 @@ def main(args):
         if args.use_ema:
             trainable_params_save = [p for p in unet_unwrapped.parameters() if p.requires_grad]
             ema_unet.store(trainable_params_save)
+            ema_vae.store(vae_trainable_params)
             ema_unet.copy_to(trainable_params_save)
+            ema_vae.copy_to(vae_trainable_params)
             
         pipeline = ImageDreamPipeline(
-            vae=accelerator.unwrap_model(vae),
+            vae=accelerator.unwrap_model(vae).vae,
             unet=unet_unwrapped,
             image_encoder=accelerator.unwrap_model(image_encoder),
             tokenizer=tokenizer,
@@ -744,11 +830,13 @@ def main(args):
         )
         pipeline_save_path = os.path.join(args.output_dir, f"pipeline-final")
         pipeline.save_pretrained(pipeline_save_path)
+        vae_gt.save_pretrained(os.path.join(pipeline_save_path, 'vae_rgb'))
         print(f"-> File/Cartella salvato in: {pipeline_save_path} | Dimensione: {get_path_size_str(pipeline_save_path)}")
 
         # RIPRISTINO PESI ORIGINALI DOPO IL SALVATAGGIO
         if args.use_ema:
             ema_unet.restore([p for p in unet_unwrapped.parameters() if p.requires_grad])
+            ema_vae.restore(vae_trainable_params)
 
         if args.push_to_hub:
             upload_folder(
