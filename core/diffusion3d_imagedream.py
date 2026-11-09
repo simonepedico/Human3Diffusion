@@ -112,13 +112,18 @@ class diffusion3dgs_noise_gof(nn.Module):
 
         gt_images = data['images_output'] 
         gt_masks = data['masks_output'] 
-        gt_depth = data['depths_output'].to(pred_depths.device)
+        gt_depth = data.get('depths_output')
+        if self.opt.lambda_depth > 0 and gt_depth is None:
+            raise ValueError('Depth loss requires metric depths_output, not normalized conditioning maps.')
+        if gt_depth is not None:
+            gt_depth = gt_depth.to(pred_depths.device)
 
-        gt_normal_cam = data['normals_output'].to(pred_normals.device)
+        gt_normal_cam = data['normals_output'].to(pred_normals.device).clone()
         gt_normal_cam[:,:,1:3] = -gt_normal_cam[:,:,1:3] 
 
         gt_images = gt_images * gt_masks + bg_color.view(1, 1, 3, 1, 1) * (1 - gt_masks)
-        gt_depth = gt_depth * gt_masks + torch.zeros_like(gt_depth) * (1 - gt_masks)
+        if gt_depth is not None:
+            gt_depth = gt_depth * gt_masks
         gt_normal_cam = gt_normal_cam * gt_masks + torch.zeros_like(gt_normal_cam) * (1 - gt_masks)
 
         loss_mse = F.mse_loss(pred_images, gt_images) + F.mse_loss(pred_alphas, gt_masks)
@@ -141,9 +146,6 @@ class diffusion3dgs_noise_gof(nn.Module):
             depth_normal_world, _ = depth_to_normal(c2w, self.opt, pred_depths)
             depth_normal_world = depth_normal_world.permute(0, 1, 4, 2, 3) 
 
-            gt_depth_normal_world, gt_depth_points_normal_world = depth_to_normal(c2w, self.opt, gt_depth)
-            gt_depth_normal_world = gt_depth_normal_world.permute(0, 1, 4, 2, 3) 
-
             render_normal_cam = pred_normals 
             render_normal_cam = torch.nn.functional.normalize(render_normal_cam, p=2, dim=2)
             
@@ -152,20 +154,22 @@ class diffusion3dgs_noise_gof(nn.Module):
             
             results['depth_normal_world'] = depth_normal_world
             results['gt_normal_world'] = gt_normal_world
-            results['gt_depth_normal_world'] = gt_depth_normal_world
-            results['gt_depth_points_normal_world'] = gt_depth_points_normal_world
+            if gt_depth is not None:
+                gt_dn, gt_points = depth_to_normal(c2w, self.opt, gt_depth)
+                results['gt_depth_normal_world'] = gt_dn.permute(0, 1, 4, 2, 3)
+                results['gt_depth_points_normal_world'] = gt_points
             
             normal_error_gt_world = gt_masks * (1 - (depth_normal_world * gt_normal_world).sum(dim=2).unsqueeze(dim=2)) 
-            depth_normal_loss = normal_error_gt_world.mean() 
+            depth_normal_loss = normal_error_gt_world.sum() / gt_masks.sum().clamp_min(1) 
 
             results['normal_per_pixel_error_world'] = normal_error_gt_world
             
-            results['loss_normal_world'] = normal_error_gt_world.mean()
+            results['loss_normal_world'] = depth_normal_loss
             loss = loss + self.opt.lambda_normal * depth_normal_loss
 
         if self.opt.lambda_depth > 0:
             pred_depths = pred_depths * gt_masks
-            loss_depth = F.l1_loss(pred_depths, gt_depth)
+            loss_depth = ((pred_depths - gt_depth).abs() * gt_masks).sum() / gt_masks.sum().clamp_min(1)
             results['loss_depth'] = loss_depth
             loss = loss + self.opt.lambda_depth * loss_depth
 
